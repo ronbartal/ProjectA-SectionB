@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Retrieval corpus (handout data; not needed at grading time, kept out to keep repo lean).
+# run() only loads artifacts/ + data/public_queries.json. The corpus is only used to
+# rebuild the index offline via scripts/build_index.py on a machine that has it locally.
+data/Wikipedia Entries/
+
+# Keep the public queries tracked even though the corpus is ignored.
+!data/public_queries.json
+
+# Course handout (not part of the deliverable; keep out of the public repo)
+instructions.pdf

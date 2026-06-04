@@ -1,0 +1,3 @@
+# Placeholder so the artifacts/ directory is tracked by git.
+# Build the index locally with `python scripts/build_index.py`, then commit the
+# generated files here (e.g. index_vectors.npy, index_meta.json). Use Git LFS if large.
