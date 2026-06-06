@@ -14,6 +14,15 @@ ARTIFACTS_DIR = STUDENT_ROOT / "artifacts"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 K_EVAL = 10
 
+# Passage-chunking / retrieval parameters (shared by index build and query time).
+# MiniLM caps around 256 tokens; ~180 words keeps each window comfortably under
+# that limit even after the title prefix is prepended.
+CHUNK_WORDS = 180
+CHUNK_OVERLAP = 40
+# How many chunk hits to pull from FAISS before aggregating to distinct pages.
+# Needs to be large enough to cover >= K_EVAL distinct pages for every query.
+TOP_CHUNKS = 200
+
 
 def normalize_page_id(value: Any) -> int:
     """Coerce page_id from JSON (int or numeric string) to int."""
