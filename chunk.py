@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from utils import CHUNK_OVERLAP, CHUNK_WORDS
+from utils import CHUNK_OVERLAP, CHUNK_WORDS, PREFIX_TITLE
 
 
 @dataclass
@@ -43,12 +43,14 @@ def chunk_entry(
     *,
     chunk_words: int = CHUNK_WORDS,
     chunk_overlap: int = CHUNK_OVERLAP,
+    prefix_title: bool = PREFIX_TITLE,
 ) -> List[Chunk]:
     """
     Split one corpus entry into overlapping passage chunks.
 
-    Long pages yield multiple chunks; short pages yield exactly one. The title
-    is prefixed to every chunk so the entity name travels with each passage.
+    Long pages yield multiple chunks; short pages yield exactly one. When
+    prefix_title is True, the title is prepended so the entity name travels
+    with each passage.
     """
     page_id = int(record["page_id"])
     title = str(record.get("title", "")).strip()
@@ -63,13 +65,29 @@ def chunk_entry(
     chunks: List[Chunk] = []
     for chunk_id, window in enumerate(windows):
         body = " ".join(window)
-        text = f"{title}. {body}".strip() if title else body
+        if prefix_title and title:
+            text = f"{title}. {body}".strip()
+        else:
+            text = body
         chunks.append(Chunk(page_id=page_id, chunk_id=chunk_id, text=text))
     return chunks
 
 
-def chunk_corpus(records: List[Dict[str, Any]]) -> List[Chunk]:
+def chunk_corpus(
+    records: List[Dict[str, Any]],
+    *,
+    chunk_words: int = CHUNK_WORDS,
+    chunk_overlap: int = CHUNK_OVERLAP,
+    prefix_title: bool = PREFIX_TITLE,
+) -> List[Chunk]:
     chunks: List[Chunk] = []
     for record in records:
-        chunks.extend(chunk_entry(record))
+        chunks.extend(
+            chunk_entry(
+                record,
+                chunk_words=chunk_words,
+                chunk_overlap=chunk_overlap,
+                prefix_title=prefix_title,
+            )
+        )
     return chunks

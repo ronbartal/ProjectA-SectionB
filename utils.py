@@ -15,13 +15,15 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 K_EVAL = 10
 
 # Passage-chunking / retrieval parameters (shared by index build and query time).
-# MiniLM caps around 256 tokens; ~180 words keeps each window comfortably under
-# that limit even after the title prefix is prepended.
-CHUNK_WORDS = 180
-CHUNK_OVERLAP = 40
+# E1 winner: title_150 (150w/33, prefix_title=True) — median ~201 tokens, ~2% truncation.
+CHUNK_WORDS = 150
+CHUNK_OVERLAP = 33
+PREFIX_TITLE = True
 # How many chunk hits to pull from FAISS before aggregating to distinct pages.
 # Needs to be large enough to cover >= K_EVAL distinct pages for every query.
 TOP_CHUNKS = 200
+# Graded query phase budget: one run(queries) call (embed + retrieve), GPU at grading.
+GRADING_QUERY_TIME_LIMIT_S = 60.0
 
 
 def normalize_page_id(value: Any) -> int:

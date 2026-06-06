@@ -74,8 +74,18 @@ corpus JSON → chunk → embed → FAISS+np   queries → embed → FAISS searc
 
 | ID | Experiment | Files touched | Expected impact |
 |----|-----------|---------------|-----------------|
-| E1 | Chunking sweep — sentence-aware splits, smaller windows (80-120 words), higher overlap | `chunk.py`, `utils.py` | Medium |
-| E2 | Lexical index — persist per-chunk term frequencies, IDF stats, and vocabulary as new artifacts so Yehoraz can implement BM25 at query time | `index.py`, new artifact files | **High** (enables E4) |
+| E1 | Chunking sweep (2×2 factorial + `title_150` follow-up). **Status: 2×2 complete; `title_150` GPU run in flight.** See decision log §8. | `chunk.py`, `utils.py` | Medium (diminishing returns observed) |
+| E2 | Lexical index — BM25 artifacts in `lexical.py`, built by `index.build_index()`. **Status: complete** — production `artifacts/` has dense title_150 + BM25 (Jun 6). | `lexical.py`, `index.py` | **High** (enables E4) |
+
+**E1 solo arms (fully in Ron's scope — change chunk text/size, rebuild, measure with `diagnostics.py`):**
+
+| Arm | Change | Hypothesis |
+|-----|--------|-----------|
+| A | No title prefix (`body` only) | Baseline: does the title actually help or hurt the chunk embedding? |
+| B | Title prefix `f"{title}. {body}"` (current) | Status quo; entity anchoring across coref-heavy passages. |
+| D | Smaller `CHUNK_WORDS` (100/120) x title on/off | Eliminates truncation + concentrates the gold sentence; title matters more when body is short. Preview token cost with `scripts/audit_tokens.py --chunk-words N` (no GPU). |
+
+Front placement of the title is kept deliberately: truncation cuts the tail, so a prefix survives the 256-token cap while a suffix would not.
 
 ### 3.2  Yehoraz — query / ranking side
 
@@ -92,11 +102,13 @@ corpus JSON → chunk → embed → FAISS+np   queries → embed → FAISS searc
 |----|-----------|---------------|-----------------|
 | E3 | Aggregation sweep — try sum-of-top-N chunk scores per page instead of max-pool; tune `TOP_CHUNKS` | `retrieve.py`, `utils.py` | Medium |
 | E4 | BM25 + dense fusion — weighted combination or RRF using lexical artifacts from E2 | `retrieve.py`, possibly `utils.py` | **High** (biggest expected score jump) |
+| E5 | Title-vector fusion (cross-cutting) — Ron builds a per-page title embedding artifact (offline, like E2); Yehoraz blends its score with the chunk score at query time. Keeps the chunk embedding "pure", frees token budget, and adds entity signal. Same shape as E4 fusion. | `index.py` (Ron: artifact) + `retrieve.py` (Yehoraz: blend) | Medium-High |
 
 ### 3.3  Shared — both on Day 1
 
-- **Eval harness:** per-query NDCG@10, holdout split (35 tune / 15 holdout from the 50 public queries), timing, results log.
-- **Artifact contract:** agree on the format of any new lexical artifacts (E2) before parallel work begins.
+- **Eval harness (built): `diagnostics.py` + `scripts/diagnose.py`.** This is the single internal evaluation tool for BOTH teammates — set-aware NDCG@10 (matches `eval.py`), recall@{10,50,100}, MRR, per-relevant-page ranks, chunk-level diagnostics (gold-chunk rank, recall within `TOP_CHUNKS`), per-bucket (by n_relevant), 5-fold CV, and data-quality checks. Run `python scripts/diagnose.py --tag <name>`; compare runs with `--compare A.json B.json`. Results land in `results/` (gitignored).
+- **Evaluation discipline:** use the 5-fold CV mean +/- std (not a single split) to judge changes — 50 queries are noisy. When analyzing a result, isolate *which side* can move it: gold-chunk rank low -> chunk/embedding (Ron); gold-chunk rank high but page rank low -> aggregation/fusion (Yehoraz).
+- **Artifact contract:** agree on the format of any new artifacts (E2 lexical, E5 title-vector) before parallel work begins.
 
 ---
 
@@ -110,22 +122,73 @@ corpus JSON → chunk → embed → FAISS+np   queries → embed → FAISS searc
 | `index_meta.json` | `{"page_ids": [...], "chunk_ids": [...], "model": str, ...}` | `index.build_index()` | `index.load_index()` → `retrieve.py` |
 | `index.faiss` | FAISS `IndexFlatIP` over chunk vectors | `index.build_index()` | `index.load_index()` → `retrieve.py` |
 
-### 4.2  New artifacts needed for E4 (lexical / BM25)
+### 4.2  Lexical / BM25 artifacts (E2 → E4)
 
-> **Status:** to be built by Ron (E2), consumed by Yehoraz (E4).
-> Agree on this schema on Day 1 before parallel work begins.
-
-Proposed files (Ron will create under `artifacts/`):
+> **Status:** **built and verified** (2026-06-06). Ron's E2 scope complete; Yehoraz unblocked for E4.
+> Chunk config locked: `CHUNK_WORDS=150`, `CHUNK_OVERLAP=33`, `PREFIX_TITLE=True`.
+> **Dense-only NDCG unchanged by BM25 files** until E4 fusion is wired in `retrieve.py`.
 
 | File | Format | Contents |
 |------|--------|----------|
-| `bm25_vocab.json` | `{"token": idf_float, ...}` | Vocabulary with precomputed IDF values |
-| `bm25_tf.npz` | numpy `.npz` (CSR arrays: data, indices, indptr) | Per-chunk term-frequency matrix (n_chunks × vocab_size) |
-| `bm25_meta.json` | `{"avg_dl": float, "n_docs": int, "vocab_size": int}` | Corpus-level BM25 statistics |
+| `bm25_vocab.json` | `{"token": idf_float, ...}` | Precomputed IDF per in-vocab token |
+| `bm25_tf.npz` | CSR arrays + `vocab` | `data`, `indices`, `indptr` (scipy CSR layout), `vocab` (object array: `vocab[col]` = token) |
+| `bm25_meta.json` | JSON object | Corpus stats + BM25 hyperparameters (see schema below) |
 
-**Yehoraz:** at query time, tokenize the query, look up IDF from vocab, compute BM25 scores against chunks using the TF matrix + `avg_dl`, then fuse with dense FAISS scores.
+**Definitions:**
+- **Document unit = one chunk.** CSR row `i` aligns 1:1 with `index_meta.json` `page_ids[i]` / `chunk_ids[i]`.
+- **`n_docs`** = number of chunks (not pages).
+- **`avg_dl`** = mean token count per chunk (build-time tokenizer).
+- **IDF:** `log((N - df + 0.5) / (df + 0.5) + 1)` where `N = n_docs`, `df` = chunks containing the term.
+- **Vocab pruning:** terms with `df < min_df` (default 2) are dropped; `min_df` stored in meta.
 
-> **Important:** If this format changes during the sprint, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
+**Tokenization (Ron and Yehoraz must match):**
+- Import `tokenize` from `lexical.py`: `re.findall(r"[a-z0-9]+", text.lower())`.
+- No stemming or stopwords in v1. Meta field `tokenizer`: `"regex_[a-z0-9]+_lower"`.
+
+**`bm25_meta.json` schema:**
+```json
+{
+  "n_docs": 521322,
+  "vocab_size": 123456,
+  "avg_dl": 201.0,
+  "k1": 1.5,
+  "b": 0.75,
+  "min_df": 2,
+  "tokenizer": "regex_[a-z0-9]+_lower",
+  "chunk_words": 150,
+  "chunk_overlap": 33,
+  "prefix_title": true
+}
+```
+
+**Okapi BM25 term score** (reference in `lexical.bm25_score_row`):
+```
+score(q, d) = sum over distinct t in q: IDF(t) * (tf * (k1+1)) / (tf + k1*(1 - b + b*dl/avg_dl))
+```
+where `tf` = term freq in chunk, `dl` = chunk length (token count). Each query term counts once (classic Okapi; no query-TF multiplier).
+
+**E4 integration pattern (Yehoraz — query time, fits 60s budget):**
+
+1. **Dense retrieve (existing):** FAISS → top `TOP_CHUNKS` chunk indices + cosine scores.
+2. **BM25 rescore (new):** For those indices only, score each row via CSR slice:
+   ```python
+   from lexical import load_bm25, tokenize, bm25_score_row
+   bm25 = load_bm25()  # or index.load_bm25_index()
+   q_terms = tokenize(query)
+   for row in chunk_indices:
+       lex = bm25_score_row(
+           bm25.data, bm25.indices, bm25.indptr, row,
+           q_terms, bm25.idf, bm25.vocab, bm25.avg_dl, bm25.k1, bm25.b
+       )
+   ```
+3. **Fuse per chunk:** e.g. `alpha * dense_score + (1-alpha) * lex`, or RRF.
+4. **Aggregate to pages:** existing max-pool in `retrieve.py`.
+
+**Load helpers:**
+- `lexical.load_bm25(artifacts_dir)` → `Bm25Index` dataclass
+- `index.load_bm25_index(artifacts_dir)` — thin wrapper
+
+> **Important:** If this format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
 
 ---
 
@@ -175,19 +238,20 @@ python scripts/eval_public.py
 ## 7  Timeline (7 days)
 
 ### Day 1 — Foundation (both, pair session)
-- [ ] Lock baseline NDCG@10 number
-- [ ] Build shared eval harness: per-query scores, 35/15 holdout split, timing, results log
+- [v] Lock baseline NDCG@10 number
+- [v] Build shared eval harness: per-query scores, 35/15 holdout split, timing, results log
 - [ ] Agree on E2 lexical artifact format (Section 4.2 above)
 - [ ] Yehoraz: set up local env, confirm `eval_public.py` runs
 
 ### Day 2 — First experiments (parallel)
-- [ ] **Ron → E1:** chunking parameter sweep (window size, overlap, sentence-aware splits)
+- [v] **Ron → E1:** chunking parameter sweep (window size, overlap, sentence-aware splits)
 - [ ] **Yehoraz → E3:** aggregation sweep (max-pool vs sum-of-top-N, `TOP_CHUNKS` tuning)
 - [ ] Merge winners to `main`
 
 ### Day 3 — Lexical handoff
-- [ ] **Ron → E2:** build lexical index artifacts, commit to `main`
-- [ ] **Yehoraz → E4:** scaffold BM25 fusion in `retrieve.py` against new artifacts
+- [x] **Ron → E2:** build lexical index artifacts on VM (`artifacts/` title_150 + BM25); code in `lexical.py` + `index.py`
+- [ ] **Ron:** commit code + `artifacts/` to git so Yehoraz can `git pull`
+- [ ] **Yehoraz → E4:** scaffold BM25 fusion in `retrieve.py` against new artifacts (see §4.2)
 
 ### Day 4 — Tune fusion (parallel)
 - [ ] **Yehoraz → E4:** tune fusion weights on holdout (expected biggest jump)
@@ -217,9 +281,50 @@ python scripts/eval_public.py
 
 Record every experiment result here so both teammates (and agents) have context.
 
-| Date | Exp | Branch | Holdout NDCG@10 | Delta vs baseline | Merged? | Notes |
-|------|-----|--------|-----------------|-------------------|---------|-------|
-| 2026-06-04 | baseline | `main` | _TBD_ | — | yes | Initial starter code |
+| Date | Exp | Branch | NDCG@10 | Delta vs baseline | Merged? | Notes |
+|------|-----|--------|---------|-------------------|---------|-------|
+| 2026-06-06 | baseline (full corpus) | `ron_develop` | 0.1295 | — | — | 5-fold mean (std 0.075) over 50 public queries, 27,074 pages / 437,237 chunks (CHUNK_WORDS=180, overlap=40, TOP_CHUNKS=200). recall@10/50/100 = 0.18/0.39/0.51. Per `diagnostics.py`: gold chunk rank approx equals gold page rank -> max-pool aggregation is near-lossless, so the bottleneck is chunk/embedding quality (Ron side), not aggregation. Union-oracle ceiling approx 0.19 (13 duplicate query strings carry conflicting labels). Per-bucket NDCG: n_rel=1 -> 0.19, n_rel=2 -> 0.00, n_rel=3 -> 0.17, n_rel=4 -> 0.03. |
+| 2026-06-06 | token-truncation audit (E1 prep) | `ron_develop` | — | — | n/a | `scripts/audit_tokens.py` on full corpus: chunk token lengths median 240, mean 238.8, p90 272, p95 285, max 1124 vs MiniLM cap 256. 98,523 chunks (22.5%) exceed 256 and are silently truncated at encode time (median 13 tokens lost). Motivates E1: smaller CHUNK_WORDS (~100-120) to eliminate truncation and concentrate the gold sentence. |
+| 2026-06-06 | E1 `notitle_180` (arm A) | `ron_develop` | 0.1115 | −0.0180 | no | 180w/40, no title. 437k chunks. k-fold 0.1115 ± 0.043. recall@10=0.185. Gold-chunk median rank 240 (better than baseline 268) but NDCG worse — title helps page-level ranking after max-pool. |
+| 2026-06-06 | E1 `title_120` (arm D, title) | `ron_develop` | 0.1159 | −0.0136 | no | 120w/30, title on. 674k chunks. k-fold 0.1159 ± 0.095. recall@10=0.157. Worst gold-chunk ranks (median 448). Smaller windows + title = fragmentation + title noise. |
+| 2026-06-06 | E1 `notitle_120` (arm D, no title) | `ron_develop` | 0.1322 | +0.0027 | no | 120w/30, no title. 674k chunks. k-fold 0.1322 ± 0.079. recall@10=0.205, MRR=0.134. 8 query wins / 8 losses vs baseline (34 ties). Superseded by `title_150`. |
+| 2026-06-06 | E1 `title_150` token audit | `ron_develop` | — | — | n/a | 150w/33, title on (preview only). Full corpus: median 201 tokens, 2.1% >256 (vs 22.5% at 180w). ~521k chunks expected. Middle ground on truncation without +54% chunk count of 120w. |
+| 2026-06-06 | E1 `title_150` (follow-up) | `ron_develop` | 0.1332 | +0.0037 | **yes (locked)** | 150w/33, title on. 521,322 chunks. k-fold 0.1332 ± 0.078. recall@10=0.195, MRR=0.128. query_phase ~1.83s. **Best E1 arm — chunk config locked for E2 rebuild.** |
+| 2026-06-06 | E2 production rebuild | `ron_develop` | 0.1332 | +0.0037 | **yes** | `artifacts/`: title_150 dense (764M vectors + 764M faiss) + BM25 (`bm25_tf.npz` 393M, `bm25_vocab.json` 9.6M, vocab=319,990, avg_dl=152.4, min_df=2). `eval_public.py` NDCG=0.1332, query_phase=3.0s. `diagnose --tag production_e2`: sanity PASSED, query_phase=1.9s OK. **No score lift from BM25 until E4** — artifacts ready for Yehoraz. Future rebuild tip: copy dense from `artifacts_sweep/title_150/` + BM25-only to skip re-embed. |
+
+### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06)
+
+**2×2 results (title × size):**
+
+| | 180w / ovlp 40 | 120w / ovlp 30 |
+|---|---|---|
+| **title ON** | 0.1295 baseline | 0.1159 |
+| **title OFF** | 0.1115 | **0.1322** |
+
+**Key findings:**
+- **Strong interaction:** title helps at 180w (+0.018) but hurts at 120w (−0.016). No universal “title on” or “smaller is better.”
+- **Truncation hypothesis mostly rejected:** 120w nearly eliminates truncation but still underperforms; bottleneck is chunk *matching*, not tail clipping (consistent with gold-chunk rank ≈ page rank).
+- **Chunking alone has a low ceiling** (~±0.02 NDCG on 50 public queries). Multi-relevant buckets (n_rel≥2) stay weak across all arms.
+- **E4 (BM25 + dense fusion)** remains the highest-expected-impact track per §3.2; E2 unblocks it.
+
+**Agreed Ron priority (updated after E2):**
+1. **E1 + E2 complete.** Production `artifacts/` on VM: title_150 dense + BM25 per §4.2.
+2. **Yehoraz → E4:** BM25 + dense fusion in `retrieve.py` (Ron does not touch `retrieve.py`).
+3. **Ron next (optional):** commit code + artifacts to git for Yehoraz `git pull`; sentence-aware splitting deferred until after E4 results.
+
+### 8.2  Yehoraz E4 handoff checklist (Ron E2 complete)
+
+**Artifacts in `artifacts/` (VM, ready):**
+- Dense: `index_vectors.npy`, `index.faiss`, `index_meta.json` (521,322 chunks, 150w/33/title)
+- Lexical: `bm25_tf.npz`, `bm25_vocab.json`, `bm25_meta.json`
+
+**Code to import:**
+- `from lexical import tokenize, load_bm25, bm25_score_row`
+- Integration pattern: §4.2 (FAISS top-K → BM25 rescore rows → fuse → max-pool)
+
+**Verified dense baseline (no fusion yet):** NDCG@10 = **0.1332**, query_phase **~2s**, within 60s budget.
+
+**Notify Yehoraz:** `git pull` after Ron commits artifacts (~1.9GB total on VM).
 
 ---
 
@@ -237,7 +342,7 @@ Record every experiment result here so both teammates (and agents) have context.
 6. **Test your changes** by running `python scripts/eval_public.py` and reporting the `mean_ndcg@10` score.
 7. **Priority experiments** (in order):
    - **E3:** In `retrieve.py`, change `_rank_pages_from_chunks` to try sum-of-top-N chunk scores instead of max-pool. Sweep N ∈ {1, 2, 3, 5}. Also try tuning `TOP_CHUNKS` in `utils.py` (try 100, 200, 300, 500).
-   - **E4:** Once `bm25_*.json`/`.npz` artifacts exist in `artifacts/`, implement BM25 scoring at query time and fuse with dense FAISS scores using a weighted sum. Tune the weight (e.g. 0.3 BM25 + 0.7 dense).
+   - **E4:** BM25 artifacts are in `artifacts/` (`bm25_vocab.json`, `bm25_tf.npz`, `bm25_meta.json`). Import `tokenize`, `load_bm25`, `bm25_score_row` from `lexical.py` (or `index.load_bm25_index()`). Rescore top-K FAISS hits only — see §4.2. Fuse with dense scores (weighted sum or RRF), then max-pool to pages.
 8. **Always** record before/after NDCG@10 for every change.
 9. **Latency matters:** the query phase is timed. Avoid O(n²) loops over the full corpus at query time. Vectorized numpy operations are preferred.
 
@@ -246,8 +351,9 @@ Record every experiment result here so both teammates (and agents) have context.
 1. **Your scope:** `chunk.py`, `embed.py`, `index.py`, `scripts/build_index.py`, and artifact generation.
 2. **Do not** modify `eval.py` or `retrieve.py`.
 3. **After any index change**, rebuild artifacts by running `python scripts/build_index.py`, then test with `python scripts/eval_public.py`.
-4. **Priority experiments:**
-   - **E1:** Sweep `CHUNK_WORDS` (80, 100, 120, 150, 180) and `CHUNK_OVERLAP` (20, 40, 60) in `utils.py`. Try sentence-aware splitting in `chunk.py`.
-   - **E2:** Add lexical artifact generation to `index.py` — compute per-chunk TF, corpus IDF, avg document length. Save as `artifacts/bm25_vocab.json`, `artifacts/bm25_tf.npz`, `artifacts/bm25_meta.json` per the contract in Section 4.2.
+4. **Priority experiments (updated 2026-06-06):**
+   - **E1:** 2×2 complete; `title_150` follow-up in flight. Lock chunk config after it lands — **no further size sweeps** unless `title_150` is inconclusive.
+   - **E2 (done):** `lexical.py` + hook in `index.build_index()`. VM production rebuild verified (`diag_production_e2.json`). Commit code + `artifacts/` for Yehoraz.
+   - **Sentence-aware splitting:** deferred until after E2 handoff or final rebuild (see §8.1).
 5. **Always** record before/after NDCG@10 for every change.
 6. **Commit artifacts** to `main` only after confirming the score does not regress.
