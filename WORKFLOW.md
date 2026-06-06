@@ -120,7 +120,7 @@ Proposed files (Ron will create under `artifacts/`):
 | File | Format | Contents |
 |------|--------|----------|
 | `bm25_vocab.json` | `{"token": idf_float, ...}` | Vocabulary with precomputed IDF values |
-| `bm25_tf.npz` | scipy sparse or numpy | Per-chunk term-frequency matrix (n_chunks × vocab_size) |
+| `bm25_tf.npz` | numpy `.npz` (CSR arrays: data, indices, indptr) | Per-chunk term-frequency matrix (n_chunks × vocab_size) |
 | `bm25_meta.json` | `{"avg_dl": float, "n_docs": int, "vocab_size": int}` | Corpus-level BM25 statistics |
 
 **Yehoraz:** at query time, tokenize the query, look up IDF from vocab, compute BM25 scores against chunks using the TF matrix + `avg_dl`, then fuse with dense FAISS scores.
