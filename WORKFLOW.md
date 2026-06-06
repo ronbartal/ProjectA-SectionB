@@ -133,7 +133,7 @@ Proposed files (Ron will create under `artifacts/`):
 
 ```bash
 git clone <repo-url>
-cd ProjectA_SectionB
+cd ProjectA-SectionB
 pip install -r requirements.txt
 # MiniLM downloads automatically on first run (~80 MB, CPU is fine)
 
