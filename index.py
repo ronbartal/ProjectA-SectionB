@@ -103,13 +103,27 @@ def load_index(
     """
     Load chunk vectors, the chunk->page_id map, and the FAISS index.
 
-    The FAISS index is returned when both the library and the artifact are
-    present; otherwise it is None and callers fall back to the numpy vectors.
+    FAISS handling has three cases:
+      - faiss not importable: return index=None; callers fall back to the
+        numpy brute-force path using the loaded vectors.
+      - faiss importable and index.faiss present: return the loaded index.
+      - faiss importable but index.faiss missing: raise FileNotFoundError,
+        since this signals an incomplete build rather than an environment
+        without FAISS (fail loud instead of silently degrading).
     """
     root = artifacts_dir or ARTIFACTS_DIR
-    vectors = np.load(root / INDEX_VECTORS_NAME)
+    vectors_path = root / INDEX_VECTORS_NAME
+    meta_path = root / INDEX_META_NAME
+    missing = [p.name for p in (vectors_path, meta_path) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing index artifact(s) in {root}: {', '.join(missing)}. "
+            "Build them offline first with: python scripts/build_index.py"
+        )
+
+    vectors = np.load(vectors_path)
     vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-    meta = json.loads((root / INDEX_META_NAME).read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     page_ids = [int(x) for x in meta["page_ids"]]
 
     index = None
