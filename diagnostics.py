@@ -19,12 +19,23 @@ import numpy as np
 from embed import embed_queries
 from eval import K_EVAL, dcg_at_k, load_query_file, ndcg_at_k
 from index import load_index
+from lexical import Bm25Index, bm25_score_row, load_bm25, tokenize
 from utils import (
+    AGG_SCOPE,
     ARTIFACTS_DIR,
+    BM25_PAGE_AGG,
+    BM25_SCOPE,
     CHUNK_OVERLAP,
     CHUNK_WORDS,
+    FUSION,
     GRADING_QUERY_TIME_LIMIT_S,
+    PAGE_POOL_K,
+    PRF,
+    PRF_ALPHA,
+    PRF_PAGE_REPR,
+    PRF_TOPN,
     PUBLIC_QUERIES_PATH,
+    RRF_K,
     TOP_CHUNKS,
 )
 
@@ -97,9 +108,122 @@ def aggregate_top_k_pages(
     *,
     top_k: int = K_EVAL,
 ) -> List[int]:
-    """Mirror retrieve._rank_pages_from_chunks (max-pool, top_k pages)."""
+    """Mirror retrieve max-pool aggregation (kept for back-compat)."""
     ranked, _ = _max_pool_aggregate(chunk_indices, chunk_scores, page_ids)
     return ranked[:top_k]
+
+
+def _ranks(scores: Dict[int, float]) -> Dict[int, int]:
+    ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return {pid: r for r, (pid, _) in enumerate(ordered, start=1)}
+
+
+def _bm25_page_scores(
+    query_terms: Sequence[str],
+    candidates: Sequence[int],
+    windowed: Dict[int, List[int]],
+    page_to_chunks: Dict[int, np.ndarray],
+    bm25: Bm25Index,
+    agg: str,
+    scope: str,
+) -> Dict[int, float]:
+    cache: Dict[int, float] = {}
+
+    def bm25_of(chunk: int) -> float:
+        v = cache.get(chunk)
+        if v is None:
+            v = bm25_score_row(
+                bm25.data, bm25.indices, bm25.indptr, chunk,
+                query_terms, bm25.idf, bm25.vocab, bm25.avg_dl, bm25.k1, bm25.b,
+            )
+            cache[chunk] = v
+        return v
+
+    out: Dict[int, float] = {}
+    for pid in candidates:
+        rows = windowed[pid] if scope == "window" else page_to_chunks[pid].tolist()
+        vals = np.asarray([bm25_of(int(c)) for c in rows]) if rows else np.zeros(1)
+        if agg == "sum":
+            out[pid] = float(vals.sum())
+        elif agg == "mean":
+            out[pid] = float(vals.mean())
+        else:
+            out[pid] = float(vals.max())
+    return out
+
+
+def aggregate_to_pages(
+    sim_row: np.ndarray,
+    chunk_order: np.ndarray,
+    page_ids: Sequence[int],
+    page_to_chunks: Dict[int, np.ndarray],
+    *,
+    scope: str = AGG_SCOPE,
+    pool_k: int = PAGE_POOL_K,
+    k_window: int = TOP_CHUNKS,
+    fusion: str = "none",
+    bm25: Optional[Bm25Index] = None,
+    query_terms: Optional[Sequence[str]] = None,
+    rrf_k: int = RRF_K,
+    bm25_agg: str = BM25_PAGE_AGG,
+    bm25_scope: str = BM25_SCOPE,
+) -> List[int]:
+    """Aggregate chunk similarities to a full ranked page list (best first).
+
+    Mirrors retrieve.search_batch exactly:
+      - "window": score a page by the mean of its top-`pool_k` chunks inside the
+        top-`k_window` window (pool_k <= 0 -> all in-window chunks).
+      - "page":   candidate pages come from the window, then each is scored over
+        ALL of its chunks via the full `sim_row` (pool_k <= 0 -> all chunks).
+    When `fusion == "rrf"` (page scope), a BM25 page ranking is fused with the
+    dense ranking via Reciprocal Rank Fusion.
+
+    `chunk_order` is the full corpus chunk order (best-first) for this query;
+    `sim_row` is the query-vs-all-chunks similarity row.
+    """
+    window_idx = chunk_order[:k_window]
+    if scope == "page":
+        seen: set[int] = set()
+        candidates: List[int] = []
+        windowed: Dict[int, List[int]] = defaultdict(list)
+        for idx in window_idx:
+            i = int(idx)
+            pid = int(page_ids[i])
+            if pid not in seen:
+                seen.add(pid)
+                candidates.append(pid)
+            windowed[pid].append(i)
+        scored: Dict[int, float] = {}
+        for pid in candidates:
+            scores = sim_row[page_to_chunks[pid]]
+            if pool_k and scores.shape[0] > pool_k:
+                scores = np.partition(scores, -pool_k)[-pool_k:]
+            scored[pid] = float(scores.mean())
+        if fusion == "rrf" and bm25 is not None:
+            bm25_scores = _bm25_page_scores(
+                query_terms or [], candidates, windowed, page_to_chunks,
+                bm25, bm25_agg, bm25_scope,
+            )
+            rd = _ranks(scored)
+            rb = _ranks(bm25_scores)
+            fused = {
+                pid: 1.0 / (rrf_k + rd[pid]) + 1.0 / (rrf_k + rb.get(pid, 10 ** 9))
+                for pid in scored
+            }
+            ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+            return [pid for pid, _ in ordered]
+    else:
+        totals: Dict[int, float] = {}
+        counts: Dict[int, int] = {}
+        for idx in window_idx:
+            pid = int(page_ids[int(idx)])
+            c = counts.get(pid, 0)
+            if pool_k <= 0 or c < pool_k:
+                totals[pid] = totals.get(pid, 0.0) + float(sim_row[int(idx)])
+                counts[pid] = c + 1
+        scored = {pid: totals[pid] / counts[pid] for pid in totals}
+    ordered = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
+    return [pid for pid, _ in ordered]
 
 
 def _chunk_order_and_scores(
@@ -249,6 +373,10 @@ def measure_query_phase_time(
     *,
     artifacts_dir: Optional[Path] = None,
     top_chunks: int = TOP_CHUNKS,
+    scope: str = AGG_SCOPE,
+    pool_k: int = PAGE_POOL_K,
+    fusion: str = FUSION,
+    prf: bool = PRF,
     time_limit_s: float = GRADING_QUERY_TIME_LIMIT_S,
 ) -> Tuple[List[List[int]], Dict[str, Any]]:
     """
@@ -261,7 +389,8 @@ def measure_query_phase_time(
     root = artifacts_dir or ARTIFACTS_DIR
     t0 = time.perf_counter()
     ranked = search_batch(
-        queries, top_k=K_EVAL, top_chunks=top_chunks, artifacts_dir=root
+        queries, top_k=K_EVAL, top_chunks=top_chunks, artifacts_dir=root,
+        scope=scope, pool_k=pool_k, fusion=fusion, prf=prf,
     )
     elapsed = time.perf_counter() - t0
     timing = {
@@ -280,7 +409,10 @@ def run_diagnostics(
     queries_path: Optional[Path] = None,
     kfold: int = 5,
     top_chunks: int = TOP_CHUNKS,
-    aggregation: str = "max_pool",
+    scope: str = AGG_SCOPE,
+    pool_k: int = PAGE_POOL_K,
+    fusion: str = FUSION,
+    prf: bool = PRF,
     tag: str = "baseline",
     sanity_check: bool = True,
     time_run: bool = True,
@@ -288,11 +420,12 @@ def run_diagnostics(
     """
     Run the full diagnostic harness and return a structured report.
 
-    Uses numpy exact search over all chunks; default aggregation mirrors
-    retrieve.py max-pool over the top_chunks window.
+    Uses numpy exact search over all chunks; aggregation mirrors
+    retrieve.search_batch for the given `scope` / `pool_k` / `fusion` (defaults
+    from utils).
     """
-    if aggregation != "max_pool":
-        raise ValueError(f"Unsupported aggregation: {aggregation!r}")
+    if scope not in ("window", "page"):
+        raise ValueError(f"Unsupported scope: {scope!r}")
 
     root = artifacts_dir or ARTIFACTS_DIR
     qpath = queries_path or PUBLIC_QUERIES_PATH
@@ -303,6 +436,15 @@ def run_diagnostics(
     vectors, page_ids_list, _index = load_index(root)
     page_ids_arr = np.asarray(page_ids_list, dtype=np.int64)
     corpus_pages = set(int(x) for x in page_ids_list)
+    page_to_chunks: Dict[int, np.ndarray] = {}
+    if scope == "page":
+        _tmp: Dict[int, List[int]] = defaultdict(list)
+        for _ci, _pid in enumerate(page_ids_list):
+            _tmp[int(_pid)].append(_ci)
+        page_to_chunks = {p: np.asarray(v, dtype=np.int64) for p, v in _tmp.items()}
+
+    use_fusion = scope == "page" and fusion == "rrf"
+    bm25 = load_bm25(root) if use_fusion else None
 
     missing_ids, n_missing = _check_missing_relevant(ground_truth, corpus_pages)
     dup_info = _duplicate_query_analysis(rows)
@@ -316,6 +458,25 @@ def run_diagnostics(
 
     n_chunks = vectors.shape[0]
     k_window = min(top_chunks, n_chunks) if n_chunks else 0
+
+    # PRF: expand each query from the first pass, then rank on the expanded sims.
+    # Uses retrieve._prf_expand_query so the harness mirrors production exactly.
+    use_prf = scope == "page" and prf and query_vectors.size and k_window
+    if use_prf:
+        from retrieve import _prf_expand_query
+
+        expanded = np.empty_like(query_vectors)
+        for i in range(len(queries)):
+            if not queries[i].strip():
+                expanded[i] = query_vectors[i]
+                continue
+            part = np.argpartition(-sims[i], k_window - 1)[:k_window]
+            wo = part[np.argsort(-sims[i][part])]
+            expanded[i] = _prf_expand_query(
+                query_vectors[i], wo, page_ids_list, page_to_chunks, vectors
+            )
+        query_vectors = np.ascontiguousarray(expanded.astype(np.float32))
+        sims = query_vectors @ vectors.T
 
     per_query: List[QueryDiagnostics] = []
     ranked_top10: List[List[int]] = []
@@ -331,12 +492,14 @@ def run_diagnostics(
             full_ranked: List[int] = []
             chunk_order = np.array([], dtype=int)
         else:
-            chunk_order, chunk_scores = _chunk_order_and_scores(sims[i])
-            window_idx = chunk_order[:k_window]
-            window_scores = chunk_scores[:k_window]
-            full_ranked, _ = _max_pool_aggregate(window_idx, window_scores, page_ids_list)
+            chunk_order, _chunk_scores = _chunk_order_and_scores(sims[i])
+            full_ranked = aggregate_to_pages(
+                sims[i], chunk_order, page_ids_list, page_to_chunks,
+                scope=scope, pool_k=pool_k, k_window=k_window,
+                fusion=fusion, bm25=bm25,
+                query_terms=tokenize(queries[i]) if use_fusion else None,
+            )
             top10 = full_ranked[:K_EVAL]
-            chunk_order = chunk_order  # full corpus chunk order
 
         ranked_top10.append(top10)
         ranked_full[row["query_id"]] = full_ranked
@@ -425,6 +588,10 @@ def run_diagnostics(
             queries,
             artifacts_dir=root,
             top_chunks=top_chunks,
+            scope=scope,
+            pool_k=pool_k,
+            fusion=fusion,
+            prf=prf,
         )
 
     # Sanity: harness top-10 vs retrieve.search_batch (reuses timed call above).
@@ -472,7 +639,16 @@ def run_diagnostics(
     config = {
         "artifacts_dir": str(root),
         "queries_path": str(qpath),
-        "aggregation": aggregation,
+        "scope": scope,
+        "pool_k": pool_k,
+        "fusion": fusion,
+        "bm25_page_agg": BM25_PAGE_AGG if fusion == "rrf" else None,
+        "bm25_scope": BM25_SCOPE if fusion == "rrf" else None,
+        "rrf_k": RRF_K if fusion == "rrf" else None,
+        "prf": bool(use_prf),
+        "prf_alpha": PRF_ALPHA if use_prf else None,
+        "prf_topn": PRF_TOPN if use_prf else None,
+        "prf_page_repr": PRF_PAGE_REPR if use_prf else None,
         "top_chunks": top_chunks,
         "k_eval": K_EVAL,
         "chunk_words": meta.get("chunk_words", CHUNK_WORDS),
@@ -536,6 +712,23 @@ def print_report_summary(report: DiagnosticReport) -> None:
     print(f"tag={report.tag}")
     print(f"artifacts={report.config['artifacts_dir']}")
     print(f"num_queries={s['num_queries']}  num_chunks={report.config['num_chunks']}")
+    print(
+        f"aggregation: scope={report.config.get('scope')}  "
+        f"pool_k={report.config.get('pool_k')} (0=all)  "
+        f"top_chunks={report.config.get('top_chunks')}"
+    )
+    if report.config.get("fusion") == "rrf":
+        print(
+            f"fusion: rrf(k={report.config.get('rrf_k')})  "
+            f"bm25_agg={report.config.get('bm25_page_agg')}  "
+            f"bm25_scope={report.config.get('bm25_scope')}"
+        )
+    if report.config.get("prf"):
+        print(
+            f"prf: alpha={report.config.get('prf_alpha')}  "
+            f"top_n={report.config.get('prf_topn')}  "
+            f"page_repr={report.config.get('prf_page_repr')}"
+        )
     print()
     print("=== Scoreboard (matches eval_public.py NDCG math) ===")
     print(f"mean_ndcg@10={s['mean_ndcg_at_10']:.4f}")
