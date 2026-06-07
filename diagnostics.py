@@ -613,8 +613,8 @@ def compare_reports(path_a: Path, path_b: Path) -> None:
         print(f"  {qid}  n_rel={n_rel}  {da:.4f} -> {db:.4f}  ({sign}{delta:.4f})")
 
     print("\nPer-bucket mean NDCG@10:")
-    buckets_a = {b["n_relevant"]: b for b in a["bucket_summaries"]}
-    buckets_b = {b["n_relevant"]: b for b in b["bucket_summaries"]}
+    buckets_a = {row["n_relevant"]: row for row in a["bucket_summaries"]}
+    buckets_b = {row["n_relevant"]: row for row in b["bucket_summaries"]}
     for n_rel in sorted(set(buckets_a) | set(buckets_b)):
         ba = buckets_a.get(n_rel, {}).get("mean_ndcg_at_10", float("nan"))
         bb = buckets_b.get(n_rel, {}).get("mean_ndcg_at_10", float("nan"))
