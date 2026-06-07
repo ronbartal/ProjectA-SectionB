@@ -10,7 +10,7 @@ sys.path.insert(0, str(STUDENT_ROOT))
 
 from eval import evaluate_run, load_query_file
 from main import run
-from utils import PUBLIC_QUERIES_PATH
+from utils import GRADING_QUERY_TIME_LIMIT_S, PUBLIC_QUERIES_PATH
 
 
 def main() -> None:
@@ -25,6 +25,11 @@ def main() -> None:
     print(f"public_queries={len(queries)}")
     print(f"mean_ndcg@10={stats['mean_ndcg@10']:.4f}")
     print(f"query_phase_time={elapsed:.2f}s")
+    if elapsed > GRADING_QUERY_TIME_LIMIT_S:
+        print(
+            f"WARNING: query phase exceeds grading limit "
+            f"({GRADING_QUERY_TIME_LIMIT_S:.0f}s)"
+        )
 
 
 if __name__ == "__main__":
