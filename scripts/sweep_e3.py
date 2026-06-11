@@ -173,7 +173,8 @@ def main() -> None:
     sims = qv @ vectors.T  # (n_queries, n_chunks)
     n_chunks = vectors.shape[0]
     cap = min(max_window, n_chunks)
-
+    if cap <= 0:
+        raise ValueError("Empty index (0 chunks); cannot run E3 sweep")
     # page_id -> all chunk indices on that page (for page-scope rescoring).
     page_to_chunks: Dict[int, np.ndarray] = {}
     if "page" in args.scope:
