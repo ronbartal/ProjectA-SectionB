@@ -21,9 +21,10 @@ def main() -> None:
     parser.add_argument("--prefix-title", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
-    records = list(iter_entries())
+    # Stream records straight into chunking; keeping the full records list
+    # alive alongside chunks would double the corpus text in memory.
     chunks = chunk_corpus(
-        records,
+        iter_entries(),
         chunk_words=args.chunk_words,
         chunk_overlap=args.chunk_overlap,
         prefix_title=args.prefix_title,
