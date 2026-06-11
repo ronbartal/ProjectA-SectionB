@@ -56,7 +56,7 @@ def _build_page_to_chunks(page_ids: List[int]) -> Dict[int, np.ndarray]:
 
 def _topk_mean(scores: np.ndarray, pool_k: int) -> float:
     """Mean of the top-`pool_k` scores (all of them when pool_k <= 0)."""
-    if pool_k and scores.shape[0] > pool_k:
+    if pool_k > 0 and scores.shape[0] > pool_k:
         scores = np.partition(scores, -pool_k)[-pool_k:]
     return float(scores.mean())
 
