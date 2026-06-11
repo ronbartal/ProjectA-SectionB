@@ -4,15 +4,17 @@
 >
 > **Goal:** Maximize mean NDCG@10 on 50 hidden queries within a 1-week sprint.
 >
-> **Last updated:** 2026-06-04
+> **Last updated:** 2026-06-07
 
 ---
 
 ## 1  Project overview
 
-A semantic retrieval pipeline over ~9 600 Wikipedia pages.
+A semantic retrieval pipeline over **~27 074 Wikipedia pages** (full corpus on Ron's VM; verified in `results/diag_baseline.json`).
 The grader calls `main.run(queries)` once with all evaluation queries.
 Only the first 10 page_ids per query are scored (NDCG@10, binary relevance).
+
+**Corpus caveat:** `data/Wikipedia Entries/` is gitignored. The **complete** corpus (~27k files) exists **only on the VM**. A laptop checkout may contain a **partial** subset (~9.6k files) — offline index builds and corpus-wide audits must run on the VM; evaluate locally using committed `artifacts/` only.
 
 ### Pipeline stages
 
@@ -45,13 +47,18 @@ corpus JSON → chunk → embed → FAISS+np   queries → embed → FAISS searc
 ├── scripts/
 │   ├── build_index.py   # Offline build driver
 │   └── eval_public.py   # Public self-test
-├── artifacts/           # Committed index files (Ron builds, never Yehoraz)
+├── artifacts/           # Production default index (Ron builds; graded on `main`)
 │   ├── index_vectors.npy
 │   ├── index_meta.json
-│   └── index.faiss
+│   ├── index.faiss
+│   └── bm25_*           # E2 lexical (same six-file set per variant)
+├── artifacts_variants/  # E1 sweep indices on `ron_develop` only (Git LFS)
+│   ├── title_150/
+│   ├── notitle_150/
+│   └── notitle_180/     # title_180 = Jun baseline — scores only (§4.3)
 ├── data/
 │   ├── public_queries.json   # 50 labelled queries (tracked)
-│   └── Wikipedia Entries/    # Raw corpus (gitignored — Ron's VM only)
+│   └── Wikipedia Entries/    # Raw corpus (gitignored; full ~27k on VM, partial locally)
 ├── requirements.txt
 └── WORKFLOW.md               # ← this file
 ```
@@ -74,7 +81,7 @@ corpus JSON → chunk → embed → FAISS+np   queries → embed → FAISS searc
 
 | ID | Experiment | Files touched | Expected impact |
 |----|-----------|---------------|-----------------|
-| E1 | Chunking sweep (2×2 factorial + `title_150` follow-up). **Status: 2×2 complete; `title_150` GPU run in flight.** See decision log §8. | `chunk.py`, `utils.py` | Medium (diminishing returns observed) |
+| E1 | Chunking sweep (2×2 factorial + `title_150` follow-up). **Status: complete.** Three LFS variants on `ron_develop`; `title_180` = Jun baseline (§4.3). See decision log §8. | `chunk.py`, `utils.py` | Medium (diminishing returns observed) |
 | E2 | Lexical index — BM25 artifacts in `lexical.py`, built by `index.build_index()`. **Status: complete** — production `artifacts/` has dense title_150 + BM25 (Jun 6). | `lexical.py`, `index.py` | **High** (enables E4) |
 
 **E1 solo arms (fully in Ron's scope — change chunk text/size, rebuild, measure with `diagnostics.py`):**
@@ -188,7 +195,63 @@ where `tf` = term freq in chunk, `dl` = chunk length (token count). Each query t
 - `lexical.load_bm25(artifacts_dir)` → `Bm25Index` dataclass
 - `index.load_bm25_index(artifacts_dir)` — thin wrapper
 
+### 4.2.1  Page-level embeddings (E5)
+
+> **Status:** build script ready (`scripts/build_page_index.py`). **Chunk-config independent** — one copy in `artifacts/` shared across all variant dirs.
+> **Build on VM only** (needs full corpus). No second FAISS index; query-time lookup by `page_id`.
+
+| File | Format | Contents |
+|------|--------|----------|
+| `page_vectors.npy` | `float32 (n_pages, 384)` L2-normalized | MiniLM embeddings |
+| `page_meta.json` | JSON | `page_ids` (sorted), `recipe`, `model`, `dim`, `num_pages` |
+
+**Embed text recipe** (`page_index.page_embed_text`): `title . first_sentence . last_sentence` (last omitted if same as first). Built by `page_index.build_page_index()` / `python scripts/build_page_index.py`.
+
+**Query-time (Yehoraz — after E4 or with fusion):**
+```python
+from index import load_page_index
+pages = load_page_index(artifacts_dir)  # or artifacts_dir=Path(...)
+page_score = pages.score(query_vector, page_id)  # dot product, vectors normalized
+```
+
+Optional neighbor + page fusion (see session notes): `s* = a*s(chunk) + b*s(prev) + c*s(next) + d*page_score`, then max-pool to pages.
+
 > **Important:** If this format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
+
+### 4.3  Multi-index variants on `ron_develop` (Git LFS)
+
+> **Purpose:** Let Yehoraz A/B-test chunking configs at query time (E3/E4) without rebuilding on his machine.
+> **Deployment:** `main` keeps a **single** winning index in `artifacts/` only — pick the best arm after E1 + E4.
+
+**E1 factorial (150, 180) × (title, notitle)** — all four arms measured; **three LFS artifact dirs** ship on `ron_develop`:
+
+| Tag | `chunk_words` | `chunk_overlap` | `prefix_title` | Artifacts |
+|-----|---------------|-----------------|----------------|-----------|
+| `title_150` | 150 | 33 | true | `artifacts_variants/title_150/` |
+| `notitle_150` | 150 | 33 | false | `artifacts_variants/notitle_150/` |
+| `title_180` | 180 | 40 | true | **Baseline only** — `results/diag_baseline.json` (Jun 4 build, NDCG 0.1295). No separate LFS dir; superseded by `title_150` for production. |
+| `notitle_180` | 180 | 40 | false | `artifacts_variants/notitle_180/` |
+
+Each LFS directory holds the **same six files** as §4.1–4.2 (`index_vectors.npy`, `index.faiss`, `index_meta.json`, `bm25_tf.npz`, `bm25_vocab.json`, `bm25_meta.json`). ~2 GB LFS per variant (~6 GB for the three dirs on `ron_develop`).
+
+**`artifacts/` vs `artifacts_variants/`:**
+- `artifacts/` — production default; `main.run()` and `eval_public.py` use this path. Currently mirrors `title_150` (E1 winner so far).
+- `artifacts_variants/<tag>/` — alternate indices for local experiments on `ron_develop` only.
+
+**Git LFS** (`.gitattributes`): patterns cover both `artifacts/` and `artifacts_variants/**` for `*.npy`, `*.faiss`, `*.npz`, `index_meta.json`, `bm25_vocab.json`. After pull: `git lfs pull`.
+
+**Switching index at query time** (Yehoraz — does not change `main.run()`):
+
+```python
+from pathlib import Path
+from retrieve import search_batch
+
+hits = search_batch(queries, artifacts_dir=Path("artifacts_variants/notitle_150"))
+```
+
+Or: `python scripts/diagnose.py --artifacts-dir artifacts_variants/notitle_150 --tag notitle_150`
+
+**Promote winner to `main`:** copy the chosen variant into `artifacts/`, drop `artifacts_variants/` from `main` (or stop tracking variants) to keep the graded repo lean.
 
 ---
 
@@ -206,11 +269,12 @@ python scripts/eval_public.py
 
 **What you need from git (all tracked):**
 - All `.py` files
-- `artifacts/` (Ron commits these — never rebuild locally)
+- `artifacts/` — production default index (never rebuild locally)
+- `artifacts_variants/` — three E1 indices on `ron_develop` only (§4.3); run `git lfs pull` after clone/pull
 - `data/public_queries.json`
 
 **What you do NOT need:**
-- `data/Wikipedia Entries/` (gitignored, only on Ron's VM)
+- `data/Wikipedia Entries/` (gitignored; full ~27k-file corpus is on Ron's VM only — local partial copy is not for rebuilds)
 - GPU (CPU works for query-time eval; times will be slower but scores are identical)
 
 ---
@@ -230,8 +294,17 @@ python scripts/eval_public.py
 
 1. Every PR description includes **before/after holdout NDCG@10**.
 2. No merge if holdout score regresses vs current `main`.
-3. After merge to `main`, **Ron rebuilds artifacts on VM** (if indexing changed) and commits them.
+3. After merge to `main`, **Ron promotes the winning index** into `artifacts/` only (single LFS set). The three `artifacts_variants/` dirs stay on `ron_develop` for experimentation — not required on `main`.
 4. Both run `eval_public.py` after pulling `main` to confirm.
+
+### Git LFS on `ron_develop`
+
+| Location | Contents | When |
+|----------|----------|------|
+| `artifacts/` | Production default (currently `title_150`) | `main` + `ron_develop` |
+| `artifacts_variants/{title_150,notitle_150,notitle_180}/` | Full six-file index per E1 arm | `ron_develop` only |
+
+Ron is the sole committer of LFS blobs. Yehoraz: `git lfs pull` after every pull that touches artifacts.
 
 ---
 
@@ -290,16 +363,17 @@ Record every experiment result here so both teammates (and agents) have context.
 | 2026-06-06 | E1 `notitle_120` (arm D, no title) | `ron_develop` | 0.1322 | +0.0027 | no | 120w/30, no title. 674k chunks. k-fold 0.1322 ± 0.079. recall@10=0.205, MRR=0.134. 8 query wins / 8 losses vs baseline (34 ties). Superseded by `title_150`. |
 | 2026-06-06 | E1 `title_150` token audit | `ron_develop` | — | — | n/a | 150w/33, title on (preview only). Full corpus: median 201 tokens, 2.1% >256 (vs 22.5% at 180w). ~521k chunks expected. Middle ground on truncation without +54% chunk count of 120w. |
 | 2026-06-06 | E1 `title_150` (follow-up) | `ron_develop` | 0.1332 | +0.0037 | **yes (locked)** | 150w/33, title on. 521,322 chunks. k-fold 0.1332 ± 0.078. recall@10=0.195, MRR=0.128. query_phase ~1.83s. **Best E1 arm — chunk config locked for E2 rebuild.** |
+| 2026-06-07 | E1 `notitle_150` | `ron_develop` | 0.1290 | −0.0005 | no | 150w/33, no title. 521,322 chunks. k-fold 0.1290 ± 0.072. recall@10=0.195. Title prefix still wins at 150w (+0.0042 vs this arm). |
 | 2026-06-06 | E2 production rebuild | `ron_develop` | 0.1332 | +0.0037 | **yes** | `artifacts/`: title_150 dense (764M vectors + 764M faiss) + BM25 (`bm25_tf.npz` 393M, `bm25_vocab.json` 9.6M, vocab=319,990, avg_dl=152.4, min_df=2). `eval_public.py` NDCG=0.1332, query_phase=3.0s. `diagnose --tag production_e2`: sanity PASSED, query_phase=1.9s OK. **No score lift from BM25 until E4** — artifacts ready for Yehoraz. Future rebuild tip: copy dense from `artifacts_sweep/title_150/` + BM25-only to skip re-embed. |
 
 ### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06)
 
-**2×2 results (title × size):**
+**Factorial results (title × size):**
 
-| | 180w / ovlp 40 | 120w / ovlp 30 |
-|---|---|---|
-| **title ON** | 0.1295 baseline | 0.1159 |
-| **title OFF** | 0.1115 | **0.1322** |
+| | 180w / ovlp 40 | 150w / ovlp 33 | 120w / ovlp 30 |
+|---|---|---|---|
+| **title ON** | 0.1295 baseline | **0.1332** | 0.1159 |
+| **title OFF** | 0.1115 | 0.1290 | 0.1322 |
 
 **Key findings:**
 - **Strong interaction:** title helps at 180w (+0.018) but hurts at 120w (−0.016). No universal “title on” or “smaller is better.”
@@ -307,16 +381,17 @@ Record every experiment result here so both teammates (and agents) have context.
 - **Chunking alone has a low ceiling** (~±0.02 NDCG on 50 public queries). Multi-relevant buckets (n_rel≥2) stay weak across all arms.
 - **E4 (BM25 + dense fusion)** remains the highest-expected-impact track per §3.2; E2 unblocks it.
 
-**Agreed Ron priority (updated after E2):**
-1. **E1 + E2 complete.** Production `artifacts/` on VM: title_150 dense + BM25 per §4.2.
-2. **Yehoraz → E4:** BM25 + dense fusion in `retrieve.py` (Ron does not touch `retrieve.py`).
-3. **Ron next (optional):** commit code + artifacts to git for Yehoraz `git pull`; sentence-aware splitting deferred until after E4 results.
+**Agreed Ron priority (updated 2026-06-07):**
+1. **E1 + E2 complete.** Production `artifacts/` = `title_150` dense + BM25. `title_180` baseline (0.1295) — no artifact rebuild.
+2. **Commit three LFS variants on `ron_develop`** (§4.3): `title_150`, `notitle_150`, `notitle_180`. `title_180` baseline scores are in `diag_baseline.json` — no rebuild.
+3. **Yehoraz → E4:** BM25 + dense fusion in `retrieve.py`; sweep `artifacts_dir` across variants to find best chunking × fusion combo.
+4. **Deploy to `main`:** promote single winner into `artifacts/` only. Sentence-aware splitting deferred until after E4.
 
 ### 8.2  Yehoraz E4 handoff checklist (Ron E2 complete)
 
-**Artifacts in `artifacts/` (VM, ready):**
-- Dense: `index_vectors.npy`, `index.faiss`, `index_meta.json` (521,322 chunks, 150w/33/title)
-- Lexical: `bm25_tf.npz`, `bm25_vocab.json`, `bm25_meta.json`
+**Artifacts (VM, ready on `ron_develop`):**
+- **Default:** `artifacts/` — `title_150` (521,322 chunks, 150w/33/title) + BM25
+- **Variants for A/B:** `artifacts_variants/{title_150,notitle_150,notitle_180}/` — same six-file layout (§4.3). `title_180` scores: `results/diag_baseline.json`. Pass `artifacts_dir` to `search_batch` / `load_bm25` / `diagnose --artifacts-dir`.
 
 **Code to import:**
 - `from lexical import tokenize, load_bm25, bm25_score_row`
@@ -324,7 +399,7 @@ Record every experiment result here so both teammates (and agents) have context.
 
 **Verified dense baseline (no fusion yet):** NDCG@10 = **0.1332**, query_phase **~2s**, within 60s budget.
 
-**Notify Yehoraz:** `git pull` after Ron commits artifacts (~1.9GB total on VM).
+**Notify Yehoraz:** `git pull && git lfs pull` after Ron commits (~2 GB per variant; ~6 GB for all three on `ron_develop`).
 
 ---
 
@@ -338,11 +413,11 @@ Record every experiment result here so both teammates (and agents) have context.
 2. **Do not** modify `eval.py` (read-only per assignment rules).
 3. **Do not** modify `chunk.py`, `embed.py`, or `index.py` — those are Ron's.
 4. **Do not** rebuild or overwrite anything in `artifacts/` — treat as read-only.
-5. **Available data:** `artifacts/` (dense index) and `data/public_queries.json`. The raw corpus (`data/Wikipedia Entries/`) is not available to you.
+5. **Available data:** `artifacts/` (production default), `artifacts_variants/` (three E1 indices on `ron_develop` — §4.3), `results/diag_baseline.json` (`title_180` reference), and `data/public_queries.json`. The full raw corpus (~27k pages) is on Ron's VM only — not needed for query-time work.
 6. **Test your changes** by running `python scripts/eval_public.py` and reporting the `mean_ndcg@10` score.
 7. **Priority experiments** (in order):
    - **E3:** In `retrieve.py`, change `_rank_pages_from_chunks` to try sum-of-top-N chunk scores instead of max-pool. Sweep N ∈ {1, 2, 3, 5}. Also try tuning `TOP_CHUNKS` in `utils.py` (try 100, 200, 300, 500).
-   - **E4:** BM25 artifacts are in `artifacts/` (`bm25_vocab.json`, `bm25_tf.npz`, `bm25_meta.json`). Import `tokenize`, `load_bm25`, `bm25_score_row` from `lexical.py` (or `index.load_bm25_index()`). Rescore top-K FAISS hits only — see §4.2. Fuse with dense scores (weighted sum or RRF), then max-pool to pages.
+   - **E4:** BM25 artifacts ship with each index dir (`bm25_vocab.json`, `bm25_tf.npz`, `bm25_meta.json`). Import `tokenize`, `load_bm25`, `bm25_score_row` from `lexical.py`. Rescore top-K FAISS hits only — see §4.2. Fuse with dense scores (weighted sum or RRF), then max-pool to pages. **Sweep `artifacts_dir` across `artifacts_variants/*`** to find best chunking × fusion combo before `main` merge.
 8. **Always** record before/after NDCG@10 for every change.
 9. **Latency matters:** the query phase is timed. Avoid O(n²) loops over the full corpus at query time. Vectorized numpy operations are preferred.
 
@@ -352,8 +427,8 @@ Record every experiment result here so both teammates (and agents) have context.
 2. **Do not** modify `eval.py` or `retrieve.py`.
 3. **After any index change**, rebuild artifacts by running `python scripts/build_index.py`, then test with `python scripts/eval_public.py`.
 4. **Priority experiments (updated 2026-06-06):**
-   - **E1:** 2×2 complete; `title_150` follow-up in flight. Lock chunk config after it lands — **no further size sweeps** unless `title_150` is inconclusive.
-   - **E2 (done):** `lexical.py` + hook in `index.build_index()`. VM production rebuild verified (`diag_production_e2.json`). Commit code + `artifacts/` for Yehoraz.
+   - **E1:** complete (all four factorial arms scored; `title_180` = Jun baseline in `diag_baseline.json`). Commit three LFS variants to `artifacts_variants/` on `ron_develop` (§4.3). Lock production `artifacts/` to `title_150` for `main`.
+   - **E2 (done):** `lexical.py` + hook in `index.build_index()`. Each variant dir includes BM25. Extend `.gitattributes` for `artifacts_variants/**`.
    - **Sentence-aware splitting:** deferred until after E2 handoff or final rebuild (see §8.1).
 5. **Always** record before/after NDCG@10 for every change.
 6. **Commit artifacts** to `main` only after confirming the score does not regress.

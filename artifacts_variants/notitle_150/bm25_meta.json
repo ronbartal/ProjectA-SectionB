@@ -1,0 +1,12 @@
+{
+  "n_docs": 521322,
+  "vocab_size": 319929,
+  "avg_dl": 150.23543798266715,
+  "k1": 1.5,
+  "b": 0.75,
+  "min_df": 2,
+  "tokenizer": "regex_[a-z0-9]+_lower",
+  "chunk_words": 150,
+  "chunk_overlap": 33,
+  "prefix_title": false
+}

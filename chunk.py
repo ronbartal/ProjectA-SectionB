@@ -8,7 +8,7 @@ while the supporting fact lives deep in the body.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from utils import CHUNK_OVERLAP, CHUNK_WORDS, PREFIX_TITLE
 
@@ -74,7 +74,7 @@ def chunk_entry(
 
 
 def chunk_corpus(
-    records: List[Dict[str, Any]],
+    records: Iterable[Dict[str, Any]],
     *,
     chunk_words: int = CHUNK_WORDS,
     chunk_overlap: int = CHUNK_OVERLAP,

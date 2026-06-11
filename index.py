@@ -1,12 +1,14 @@
 """Offline index build and load (not timed at grading).
 
-Persists six artifacts:
+Persists chunk + lexical artifacts (see page_index.py for E5 page-level files):
   - index_vectors.npy : float32 (n_chunks x 384) L2-normalized chunk embeddings.
   - index_meta.json   : per-chunk page_id / chunk_id maps + build parameters.
   - index.faiss       : a FAISS IndexFlatIP over the chunk vectors (exact cosine).
   - bm25_vocab.json   : token -> IDF (E2 lexical index for E4 fusion).
   - bm25_tf.npz       : CSR term-frequency matrix per chunk (E2).
   - bm25_meta.json    : corpus BM25 statistics (E2).
+  - page_vectors.npy  : float32 (n_pages x 384) — built via scripts/build_page_index.py
+  - page_meta.json    : page_id list + E5 recipe metadata
 
 retrieve.py searches the FAISS index and aggregates chunk hits back to pages.
 The numpy vectors are kept as a fallback in case FAISS is unavailable.
@@ -27,6 +29,7 @@ except Exception:  # pragma: no cover - exercised only when faiss is missing.
 from chunk import Chunk, chunk_corpus
 from embed import embed_texts
 from lexical import build_bm25_artifacts, load_bm25
+from page_index import PageIndex, load_page_index
 from utils import (
     ARTIFACTS_DIR,
     CHUNK_OVERLAP,
@@ -168,3 +171,13 @@ def load_index(
 def load_bm25_index(artifacts_dir: Optional[Path] = None):
     """Load BM25 artifacts (delegates to lexical.load_bm25)."""
     return load_bm25(artifacts_dir)
+
+
+# Re-export for retrieve.py: from index import load_page_index, PageIndex
+__all__ = [
+    "build_index",
+    "load_index",
+    "load_bm25_index",
+    "load_page_index",
+    "PageIndex",
+]
