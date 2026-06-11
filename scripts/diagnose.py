@@ -14,7 +14,15 @@ from diagnostics import (
     run_diagnostics,
     save_report,
 )
-from utils import ARTIFACTS_DIR, PUBLIC_QUERIES_PATH
+from utils import (
+    AGG_SCOPE,
+    ARTIFACTS_DIR,
+    FUSION,
+    PAGE_POOL_K,
+    PRF,
+    PUBLIC_QUERIES_PATH,
+    TOP_CHUNKS,
+)
 
 
 def main() -> None:
@@ -39,6 +47,42 @@ def main() -> None:
         default=5,
         help="Number of folds for cross-validation (default: 5)",
     )
+    parser.add_argument(
+        "--scope",
+        type=str,
+        choices=["window", "page"],
+        default=AGG_SCOPE,
+        help=f"Aggregation scope (default from utils: {AGG_SCOPE})",
+    )
+    parser.add_argument(
+        "--pool-k",
+        type=int,
+        default=PAGE_POOL_K,
+        help=f"Mean of top-K chunks per page; 0=all (default: {PAGE_POOL_K})",
+    )
+    parser.add_argument(
+        "--top-chunks",
+        type=int,
+        default=TOP_CHUNKS,
+        help=f"Candidate window size (default from utils: {TOP_CHUNKS})",
+    )
+    parser.add_argument(
+        "--fusion",
+        type=str,
+        choices=["none", "rrf"],
+        default=FUSION,
+        help=f"Lexical (BM25) fusion method (default from utils: {FUSION})",
+    )
+    prf_group = parser.add_mutually_exclusive_group()
+    prf_group.add_argument(
+        "--prf", dest="prf", action="store_true",
+        help="Enable PRF query expansion",
+    )
+    prf_group.add_argument(
+        "--no-prf", dest="prf", action="store_false",
+        help="Disable PRF query expansion",
+    )
+    parser.set_defaults(prf=PRF)
     parser.add_argument(
         "--tag",
         type=str,
@@ -72,6 +116,11 @@ def main() -> None:
         artifacts_dir=args.artifacts_dir,
         queries_path=args.queries_path,
         kfold=args.kfold,
+        top_chunks=args.top_chunks,
+        scope=args.scope,
+        pool_k=args.pool_k,
+        fusion=args.fusion,
+        prf=args.prf,
         tag=args.tag,
         sanity_check=not args.no_sanity,
         time_run=not args.no_time_run,
