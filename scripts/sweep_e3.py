@@ -118,7 +118,7 @@ def _rank_pages_full(
     for pid in candidates:
         chunk_idx = page_to_chunks[pid]
         scores = sim_row[chunk_idx]
-        if scores.size > top_n:
+        if top_n > 0 and scores.size > top_n:
             top = np.partition(scores, -top_n)[-top_n:]
         else:
             top = scores
