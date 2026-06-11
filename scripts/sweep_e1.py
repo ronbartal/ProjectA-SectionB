@@ -33,10 +33,12 @@ class SweepConfig:
 
 
 E1_CONFIGS = (
+    SweepConfig("title_180", chunk_words=180, chunk_overlap=40, prefix_title=True),
     SweepConfig("notitle_180", chunk_words=180, chunk_overlap=40, prefix_title=False),
     SweepConfig("title_120", chunk_words=120, chunk_overlap=30, prefix_title=True),
     SweepConfig("notitle_120", chunk_words=120, chunk_overlap=30, prefix_title=False),
     SweepConfig("title_150", chunk_words=150, chunk_overlap=33, prefix_title=True),
+    SweepConfig("notitle_150", chunk_words=150, chunk_overlap=33, prefix_title=False),
 )
 
 
@@ -79,7 +81,7 @@ def main() -> None:
         "--only",
         metavar="TAG",
         choices=[c.tag for c in E1_CONFIGS],
-        help="Run a single config (e.g. title_150, notitle_180, title_120, notitle_120)",
+        help="Run a single config (e.g. title_150, notitle_150, notitle_180, title_120, notitle_120)",
     )
     args = parser.parse_args()
 

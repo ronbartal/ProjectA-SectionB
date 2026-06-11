@@ -10,7 +10,7 @@
 
 ## 1  Project overview
 
-A semantic retrieval pipeline over ~9 600 Wikipedia pages.
+A semantic retrieval pipeline over **~27 074 Wikipedia pages** (full corpus on Ron's VM; verified in `results/diag_baseline.json`).
 The grader calls `main.run(queries)` once with all evaluation queries.
 Only the first 10 page_ids per query are scored (NDCG@10, binary relevance).
 
@@ -248,6 +248,27 @@ q_terms = tokenize(query)  # original query; not PRF-expanded
 - `lexical.load_bm25(artifacts_dir)` → `Bm25Index` dataclass
 - `index.load_bm25_index(artifacts_dir)` — thin wrapper
 
+### 4.2.1  Page-level embeddings (E5)
+
+> **Status:** build script ready (`scripts/build_page_index.py`). **Chunk-config independent** — one copy in `artifacts/` shared across all variant dirs.
+> **Build on VM only** (needs full corpus). No second FAISS index; query-time lookup by `page_id`.
+
+| File | Format | Contents |
+|------|--------|----------|
+| `page_vectors.npy` | `float32 (n_pages, 384)` L2-normalized | MiniLM embeddings |
+| `page_meta.json` | JSON | `page_ids` (sorted), `recipe`, `model`, `dim`, `num_pages` |
+
+**Embed text recipe** (`page_index.page_embed_text`): `title . first_sentence . last_sentence` (last omitted if same as first). Built by `page_index.build_page_index()` / `python scripts/build_page_index.py`.
+
+**Query-time (Yehoraz — after E4 or with fusion):**
+```python
+from index import load_page_index
+pages = load_page_index(artifacts_dir)  # or artifacts_dir=Path(...)
+page_score = pages.score(query_vector, page_id)  # dot product, vectors normalized
+```
+
+Optional neighbor + page fusion (see session notes): `s* = a*s(chunk) + b*s(prev) + c*s(next) + d*page_score`, then max-pool to pages.
+
 > **Important:** If this format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
 
 ### 4.3  Chunk text artifact (E6 → cross-encoder reranking)
@@ -386,8 +407,17 @@ python scripts/sweep_rerank_ab.py
 
 1. Every PR description includes **before/after holdout NDCG@10**.
 2. No merge if holdout score regresses vs current `main`.
-3. After merge to `main`, **Ron rebuilds artifacts on VM** (if indexing changed) and commits them.
+3. After merge to `main`, **Ron promotes the winning index** into `artifacts/` only (single LFS set). The three `artifacts_variants/` dirs stay on `ron_develop` for experimentation — not required on `main`.
 4. Both run `eval_public.py` after pulling `main` to confirm.
+
+### Git LFS on `ron_develop`
+
+| Location | Contents | When |
+|----------|----------|------|
+| `artifacts/` | Production default (currently `title_150`) | `main` + `ron_develop` |
+| `artifacts_variants/{title_150,notitle_150,notitle_180}/` | Full six-file index per E1 arm | `ron_develop` only |
+
+Ron is the sole committer of LFS blobs. Yehoraz: `git lfs pull` after every pull that touches artifacts.
 
 ---
 
@@ -444,6 +474,7 @@ Record every experiment result here so both teammates (and agents) have context.
 | 2026-06-06 | E1 `notitle_120` (arm D, no title) | `ron_develop` | 0.1322 | +0.0027 | no | 120w/30, no title. 674k chunks. k-fold 0.1322 ± 0.079. recall@10=0.205, MRR=0.134. 8 query wins / 8 losses vs baseline (34 ties). Superseded by `title_150`. |
 | 2026-06-06 | E1 `title_150` token audit | `ron_develop` | — | — | n/a | 150w/33, title on (preview only). Full corpus: median 201 tokens, 2.1% >256 (vs 22.5% at 180w). ~521k chunks expected. Middle ground on truncation without +54% chunk count of 120w. |
 | 2026-06-06 | E1 `title_150` (follow-up) | `ron_develop` | 0.1332 | +0.0037 | **yes (locked)** | 150w/33, title on. 521,322 chunks. k-fold 0.1332 ± 0.078. recall@10=0.195, MRR=0.128. query_phase ~1.83s. **Best E1 arm — chunk config locked for E2 rebuild.** |
+| 2026-06-07 | E1 `notitle_150` | `ron_develop` | 0.1290 | −0.0005 | no | 150w/33, no title. 521,322 chunks. k-fold 0.1290 ± 0.072. recall@10=0.195. Title prefix still wins at 150w (+0.0042 vs this arm). |
 | 2026-06-06 | E2 production rebuild | `ron_develop` | 0.1332 | +0.0037 | **yes** | `artifacts/`: title_150 dense (764M vectors + 764M faiss) + BM25 (`bm25_tf.npz` 393M, `bm25_vocab.json` 9.6M, vocab=319,990, avg_dl=152.4, min_df=2). `eval_public.py` NDCG=0.1332, query_phase=3.0s. `diagnose --tag production_e2`: sanity PASSED, query_phase=1.9s OK. **No score lift from BM25 until E4** — artifacts ready for Yehoraz. Future rebuild tip: copy dense from `artifacts_sweep/title_150/` + BM25-only to skip re-embed. |
 | 2026-06-07 | E3a window mean-of-top-K (superseded) | `yehoraz_develop` | 0.1612 | +0.0280 | no (superseded by E3b) | First E3 step: page score = mean of its top-2 chunk scores **within the retrieved window** + `TOP_CHUNKS` 200→500. 5-fold 0.1612 ± 0.085. Every window mean-K beat max-pool; `sum`-of-top-N strictly worse (rewards long pages). Swept with `scripts/sweep_e3.py`. Kept only as the stepping stone to E3b (page scope). |
 | 2026-06-07 | **E3b page-scope mean-all** | `yehoraz_develop` | **0.2476** | **+0.1144** | no (on `yehoraz_develop`) | **Two-stage rerank** (`AGG_SCOPE="page"`, `PAGE_POOL_K=0`): FAISS top-`TOP_CHUNKS`(=500) selects CANDIDATE pages, then each candidate is rescored by the **mean cosine of ALL its chunks** vs the query (not just windowed ones). 5-fold **0.2476 ± 0.107** vs baseline 0.1332 ± 0.067. NDCG curve rose monotonically with K and plateaued once K covered the page (mean100=mean1000), i.e. parameter-free page-mean. Broad gains: recall@10 0.19→0.36, recall@50 0.37→0.64, queries-with-hit 13→23, every n_rel bucket up. `eval_public.py`=0.2476, `diagnose --tag page_meanall` sanity **PASSED**, query_phase 8.6-13s CPU (OK). Touches `retrieve.py` (`_rank_pages_page_scope`) + `utils.{AGG_SCOPE,PAGE_POOL_K,TOP_CHUNKS}`. **Shared harness updated:** `diagnostics.py`/`diagnose.py` are now aggregation-aware (`--scope`/`--pool-k`/`--top-chunks`, default from utils) so they mirror `retrieve.py` again. Headroom: union-oracle ceiling 0.357 (capped by 13 duplicate-label queries). |
@@ -454,12 +485,12 @@ Record every experiment result here so both teammates (and agents) have context.
 
 ### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06, updated 2026-06-07)
 
-**2×2 results (title × size):**
+**Factorial results (title × size):**
 
-| | 180w / ovlp 40 | 120w / ovlp 30 |
-|---|---|---|
-| **title ON** | 0.1295 baseline | 0.1159 |
-| **title OFF** | 0.1115 | **0.1322** |
+| | 180w / ovlp 40 | 150w / ovlp 33 | 120w / ovlp 30 |
+|---|---|---|---|
+| **title ON** | 0.1295 baseline | **0.1332** | 0.1159 |
+| **title OFF** | 0.1115 | 0.1290 | 0.1322 |
 
 **Key findings:**
 - **Strong interaction:** title helps at 180w (+0.018) but hurts at 120w (−0.016). No universal “title on” or “smaller is better.”
@@ -505,9 +536,9 @@ Record every experiment result here so both teammates (and agents) have context.
 
 ### 8.3  Ron E2 handoff (complete)
 
-**Artifacts in `artifacts/` (VM, ready):**
-- Dense: `index_vectors.npy`, `index.faiss`, `index_meta.json` (521,322 chunks, 150w/33/title)
-- Lexical: `bm25_tf.npz`, `bm25_vocab.json`, `bm25_meta.json`
+**Artifacts (VM, ready on `ron_develop`):**
+- **Default:** `artifacts/` — `title_150` (521,322 chunks, 150w/33/title) + BM25
+- **Variants for A/B:** `artifacts_variants/{title_150,notitle_150,notitle_180}/` — same six-file layout (§4.3). `title_180` scores: `results/diag_baseline.json`. Pass `artifacts_dir` to `search_batch` / `load_bm25` / `diagnose --artifacts-dir`.
 
 **Missing for E6:** `chunk_texts.npy` — see §8.4.
 
