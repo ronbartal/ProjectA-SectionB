@@ -196,7 +196,7 @@ def aggregate_to_pages(
         scored: Dict[int, float] = {}
         for pid in candidates:
             scores = sim_row[page_to_chunks[pid]]
-            if pool_k and scores.shape[0] > pool_k:
+            if pool_k > 0 and scores.shape[0] > pool_k:
                 scores = np.partition(scores, -pool_k)[-pool_k:]
             scored[pid] = float(scores.mean())
         if fusion == "rrf" and bm25 is not None:
