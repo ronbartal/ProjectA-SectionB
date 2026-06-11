@@ -142,7 +142,7 @@ Front placement of the title is kept deliberately: truncation cuts the tail, so 
 | PRF | Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — **0.3113 (current)** |
 | RRF-K | Shared/asymmetric K tuning. | analysis only | **done** — K=60 validated, no change |
 | **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **A/B done; blocked on §4.3** |
-| E5 | Title-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | blocked on Ron |
+| E5 | Title-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **unblocked 2026-06-11** — artifact in `artifacts/`; Yehoraz integrates (§4.2.1) |
 | follow-up | BM25 candidate generation (union BM25 top-pages with dense pool). | `retrieve.py` | exploratory — surfaced by RRF-K analysis |
 
 **Current `utils.py` production constants (on `yehoraz_develop`, not merged to `main`):**
@@ -168,7 +168,7 @@ PRF_PAGE_REPR = "mean"
 
 - **Eval harness (built): `diagnostics.py` + `scripts/diagnose.py`.** Single internal evaluation tool for BOTH teammates — set-aware NDCG@10 (matches `eval.py`), recall@{10,50,100}, MRR, per-relevant-page ranks, chunk-level diagnostics, per-bucket (by n_relevant), 5-fold CV, data-quality checks, **sanity check** (harness top-10 == `retrieve.search_batch`), and **query-phase timing**. CLI flags mirror `utils.py`: `--scope`, `--pool-k`, `--top-chunks`, `--fusion`, `--prf`/`--no-prf`. Run `python scripts/diagnose.py --tag <name>`; compare with `--compare A.json B.json`. Results in `results/` (gitignored).
 - **Evaluation discipline:** use 5-fold CV mean ± std (not a single number) — 50 queries are noisy. Use **split-half held-out tests** before adopting new fusion/rerank knobs (see RRF-K and E6 A/B lessons in §8). Isolate *which side* can move a metric: gold-chunk rank low → Ron (chunk/embedding); gold-chunk high but page rank low → Yehoraz (aggregation/fusion/rerank).
-- **Artifact contracts:** E2 lexical (§4.2, done), E6 chunk text (§4.3, **pending**), E5 title-vector (TBD).
+- **Artifact contracts:** E2 lexical (§4.2, done), E6 chunk text (§4.3, **pending**), E5 page-vector (§4.2.1, **done 2026-06-11**).
 - **Additional LLM rule:** pretrained models beyond MiniLM are allowed **only for reranking** (E6 cross-encoder). MiniLM remains the sole indexing/first-stage retrieval encoder.
 
 ---
@@ -250,26 +250,59 @@ q_terms = tokenize(query)  # original query; not PRF-expanded
 
 ### 4.2.1  Page-level embeddings (E5)
 
-> **Status:** build script ready (`scripts/build_page_index.py`). **Chunk-config independent** — one copy in `artifacts/` shared across all variant dirs.
-> **Build on VM only** (needs full corpus). No second FAISS index; query-time lookup by `page_id`.
+> **Status: BUILT 2026-06-11** on the VM (full corpus) and verified locally — **27,074 pages**, full coverage of every `page_id` in the chunk index, 0 empty-text pages, L2-normalized. Lives in `artifacts/` (`page_vectors.npy` ~40 MB via LFS, `page_meta.json` plain JSON). **Chunk-config independent** — one copy shared across all variant dirs. No second FAISS index; query-time lookup by `page_id`.
+> **Ball is now with Yehoraz** — integration in `retrieve.py` (see below).
 
 | File | Format | Contents |
 |------|--------|----------|
-| `page_vectors.npy` | `float32 (n_pages, 384)` L2-normalized | MiniLM embeddings |
-| `page_meta.json` | JSON | `page_ids` (sorted), `recipe`, `model`, `dim`, `num_pages` |
+| `page_vectors.npy` | `float32 (27074, 384)` L2-normalized | MiniLM embeddings, row i ↔ `page_ids[i]` |
+| `page_meta.json` | JSON (plain git, diffable) | `page_ids` (sorted), `recipe`, `model`, `dim`, `num_pages`, `empty_text_pages` |
 
-**Embed text recipe** (`page_index.page_embed_text`): `title . first_sentence . last_sentence` (last omitted if same as first). Built by `page_index.build_page_index()` / `python scripts/build_page_index.py`.
+**Embed text recipe** (`page_index.page_embed_text`): `title . first_sentence . last_sentence` (last omitted if same as first). Built by `python scripts/build_page_index.py` (VM only — needs full corpus).
 
-**Query-time (Yehoraz — after E4 or with fusion):**
+#### Yehoraz integration job (E5 — your move)
+
+**Goal:** blend an entity-level signal into the page ranking. The page vector encodes *what the page is about* (title + topic sentences), complementing the chunk vectors that encode *local passage content*. Expected to help entity-anchored queries and multi-relevant buckets where the right pages are in the candidate set but mis-ordered.
+
+**Where it plugs in:** `search_batch` page-scope path, after `_collect_candidates`. All candidates already have page IDs — scoring them against the page index is a dict lookup + one 384-dim dot product each (~500 per query; negligible latency).
+
+**API (already shipped, importable):**
 ```python
-from index import load_page_index
-pages = load_page_index(artifacts_dir)  # or artifacts_dir=Path(...)
-page_score = pages.score(query_vector, page_id)  # dot product, vectors normalized
+from index import load_page_index            # or: from page_index import load_page_index
+from page_index import page_scores_for_ids   # batch helper
+
+pages = load_page_index(artifacts_dir)                     # load once per search_batch call
+pv = page_scores_for_ids(pages, query_vec, candidates)     # {page_id: cosine}
 ```
 
-Optional neighbor + page fusion (see session notes): `s* = a*s(chunk) + b*s(prev) + c*s(next) + d*page_score`, then max-pool to pages.
+**Fusion options to sweep (in suggested order):**
+1. **3-way RRF** — add the page-vector ranking as a third ranker next to dense and BM25 in `_rrf_fuse`. Cheapest change, scale-free, consistent with the E4 winner.
+2. **Weighted blend into the dense score** before RRF: `s = a*chunk_mean + (1-a)*page_score`, sweep `a`.
 
-> **Important:** If this format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
+**Open design choice:** score page vectors against the **original** query vector or the **PRF-expanded** one — sweep both (precedent: BM25 keeps original terms).
+
+**Chunking-variant interaction (important — re-test E1 under E5):** the `title_150` win over `notitle_150` (+0.004 dense-only) predates E5. Once the title signal flows through the page vector, the per-chunk title prefix may become redundant or even hurt (title tokens dilute passage content in every chunk). **Sweep each E5 fusion config against both LFS indices:**
+
+```python
+hits = search_batch(queries, artifacts_dir=Path("artifacts_variants/notitle_150"))  # vs default title_150
+```
+
+| Arm | Chunk index | Title path |
+|-----|-------------|------------|
+| A | `artifacts/` (= `title_150`) | chunk prefix **and** page vector (duplicated) |
+| B | `artifacts_variants/notitle_150/` | page vector **only** (clean separation) |
+
+If B ≥ A with E5 on, promote `notitle_150` to production `artifacts/` (Ron does the promote + rebuild of `chunk_texts.npy` against the winner before E6).
+
+> **Loading note:** the page index is chunk-config independent and ships **only in `artifacts/`** — it is *not* copied into variant dirs. When testing a variant, load chunk/BM25 artifacts from the variant dir but call `load_page_index()` with **no argument** (defaults to `artifacts/`), or pass `ARTIFACTS_DIR` explicitly.
+
+**Merge criteria (same bar as E6):**
+- k-fold gain vs current 0.4274 baseline (fixed 29-query file) **and** split-half stable.
+- Mirror the blend in `diagnostics.py` so `diagnose.py` sanity PASSES.
+- `eval_public.py` `query_phase_time` < 60s (expected: unaffected).
+- Record before/after in §8 decision log.
+
+> **Important:** If the artifact format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`. Batch format changes to minimize round-trips.
 
 ### 4.3  Chunk text artifact (E6 → cross-encoder reranking)
 
@@ -502,7 +535,7 @@ Record every experiment result here so both teammates (and agents) have context.
 1. **E1 + E2 complete.** Production `artifacts/`: title_150 dense + BM25.
 2. **Yehoraz E3 + E4 + PRF complete** on `yehoraz_develop` (0.3113) — not yet merged to `main`.
 3. **Ron → E6 (NOW):** build and commit `chunk_texts.npy` per §4.3 — **unblocks reranking**.
-4. **Ron → E5 (optional, parallel or after E6):** per-page title embedding artifact.
+4. **Ron → E5: done 2026-06-11** — page-vector artifact built on VM, verified, in `artifacts/`. Yehoraz integrates (§4.2.1).
 5. Sentence-aware splitting: still deferred.
 
 ### 8.2  Yehoraz query-side progress summary (2026-06-07)
@@ -598,12 +631,17 @@ Record every experiment result here so both teammates (and agents) have context.
 5. **Available data:** `artifacts/` (dense + BM25; `chunk_texts.npy` pending) and `data/public_queries.json`. Raw corpus not available.
 6. **Test changes:** `python scripts/eval_public.py` (canonical score) **and** `python scripts/diagnose.py --tag <name>` (sanity + timing). Sanity must PASS.
 7. **Current production config (§3.2):** E3 page-scope mean-all + E4 RRF + PRF → **0.3113**. Do not regress without documenting in §8.
-8. **Next priority — E6 rerank (blocked):**
+8. **Next priority — E5 page-vector fusion (UNBLOCKED 2026-06-11):**
+   - Artifact ready in `artifacts/` (`page_vectors.npy` + `page_meta.json`); integration guide in §4.2.1.
+   - Load via `index.load_page_index()`; score candidates with `page_index.page_scores_for_ids()`.
+   - Sweep: 3-way RRF vs weighted dense blend; original vs PRF-expanded query vector; **and `title_150` vs `notitle_150` chunk index** (§4.2.1 — title prefix may be redundant once the page vector carries the title signal). Page index always loads from `artifacts/` (not in variant dirs).
+   - Merge bar: k-fold gain vs 0.4274 + split-half stable + `diagnose.py` sanity PASSED.
+9. **E6 rerank (blocked):**
    - Wait for Ron's `chunk_texts.npy` (§4.3, §8.4).
    - Rerun `python scripts/sweep_rerank_ab.py` with real text.
    - If stable + fast: implement Option A CE rerank (`RERANK_POOL≈20`, `cross-encoder/ms-marco-MiniLM-L-6-v2`).
    - Additional pretrained models **only for reranking** — never replace MiniLM for indexing.
-9. **Exploratory (lower priority):** BM25 candidate generation (union BM25 top-pages with dense pool).
+10. **Exploratory (lower priority):** BM25 candidate generation (union BM25 top-pages with dense pool).
 10. **Latency:** 60s query-phase budget. CE rerank was ~47s CPU alone — profile on GPU before merging.
 11. **Always** record before/after NDCG@10 in §8 decision log.
 
