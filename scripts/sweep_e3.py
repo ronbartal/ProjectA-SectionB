@@ -163,6 +163,8 @@ def main() -> None:
     mode_to_agg = {m: _parse_mode(m) for m in args.modes}
 
     rows = load_query_file(PUBLIC_QUERIES_PATH)
+    if args.kfold < 1 or args.kfold > len(rows):
+        parser.error(f"--kfold must be in [1, {len(rows)}], got {args.kfold}")
     queries = [r["query"] for r in rows]
     ground_truth = [r["relevant_page_ids"] for r in rows]
 
