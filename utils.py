@@ -60,6 +60,17 @@ PRF = True
 PRF_ALPHA = 0.9
 PRF_TOPN = 10
 PRF_PAGE_REPR = "mean"  # "mean" (E3-consistent) or "best" (single best chunk)
+
+# E6 cross-encoder rerank (rerank.py). The CE reorders only the top-RERANK_POOL
+# fused pages; final order = RERANK_ALPHA*ce_minmax + (1-alpha)*fused_rank_norm.
+# A/B 2026-06-12 (real chunk_texts, 29 q): pool=20 alpha=0.3 k-fold +0.0115 and
+# split-half stable; pure CE order (+0.009) was unstable -> blend only.
+# DEFAULT OFF: CE stage alone measured ~61s on local CPU (29 q) vs the 60s
+# query budget. Flip RERANK=True once GPU timing is verified (Ron, VM).
+RERANK = False
+RERANK_POOL = 20
+RERANK_ALPHA = 0.3
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 # Graded query phase budget: one run(queries) call (embed + retrieve), GPU at grading.
 GRADING_QUERY_TIME_LIMIT_S = 60.0
 

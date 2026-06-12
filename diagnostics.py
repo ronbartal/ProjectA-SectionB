@@ -18,7 +18,7 @@ import numpy as np
 
 from embed import embed_queries
 from eval import K_EVAL, load_query_file, ndcg_at_k
-from index import load_index
+from index import load_chunk_texts, load_index
 from lexical import Bm25Index, bm25_score_row, load_bm25, tokenize
 from utils import (
     AGG_SCOPE,
@@ -35,6 +35,10 @@ from utils import (
     PRF_PAGE_REPR,
     PRF_TOPN,
     PUBLIC_QUERIES_PATH,
+    RERANK,
+    RERANK_ALPHA,
+    RERANK_MODEL_NAME,
+    RERANK_POOL,
     RRF_K,
     TOP_CHUNKS,
 )
@@ -167,6 +171,9 @@ def aggregate_to_pages(
     rrf_k: int = RRF_K,
     bm25_agg: str = BM25_PAGE_AGG,
     bm25_scope: str = BM25_SCOPE,
+    rerank: bool = False,
+    query: Optional[str] = None,
+    chunk_texts: Optional[np.ndarray] = None,
 ) -> List[int]:
     """Aggregate chunk similarities to a full ranked page list (best first).
 
@@ -176,7 +183,8 @@ def aggregate_to_pages(
       - "page":   candidate pages come from the window, then each is scored over
         ALL of its chunks via the full `sim_row` (pool_k <= 0 -> all chunks).
     When `fusion == "rrf"` (page scope), a BM25 page ranking is fused with the
-    dense ranking via Reciprocal Rank Fusion.
+    dense ranking via Reciprocal Rank Fusion. When `rerank` (page scope + rrf),
+    the fused shortlist is reordered by the cross-encoder blend (rerank.py).
 
     `chunk_order` is the full corpus chunk order (best-first) for this query;
     `sim_row` is the query-vs-all-chunks similarity row.
@@ -211,7 +219,19 @@ def aggregate_to_pages(
                 for pid in scored
             }
             ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
-            return [pid for pid, _ in ordered]
+            fused_list = [pid for pid, _ in ordered]
+            if rerank and chunk_texts is not None and query is not None:
+                from rerank import rerank_pages
+
+                chunk_sim = {
+                    int(c): float(sim_row[int(c)])
+                    for rows_ in windowed.values()
+                    for c in rows_
+                }
+                fused_list = rerank_pages(
+                    query, fused_list, windowed, chunk_sim, chunk_texts,
+                )
+            return fused_list
     else:
         totals: Dict[int, float] = {}
         counts: Dict[int, int] = {}
@@ -320,6 +340,7 @@ def measure_query_phase_time(
     pool_k: int = PAGE_POOL_K,
     fusion: str = FUSION,
     prf: bool = PRF,
+    rerank: bool = RERANK,
     time_limit_s: float = GRADING_QUERY_TIME_LIMIT_S,
 ) -> Tuple[List[List[int]], Dict[str, Any]]:
     """
@@ -333,7 +354,7 @@ def measure_query_phase_time(
     t0 = time.perf_counter()
     ranked = search_batch(
         queries, top_k=K_EVAL, top_chunks=top_chunks, artifacts_dir=root,
-        scope=scope, pool_k=pool_k, fusion=fusion, prf=prf,
+        scope=scope, pool_k=pool_k, fusion=fusion, prf=prf, rerank=rerank,
     )
     elapsed = time.perf_counter() - t0
     timing = {
@@ -356,6 +377,7 @@ def run_diagnostics(
     pool_k: int = PAGE_POOL_K,
     fusion: str = FUSION,
     prf: bool = PRF,
+    rerank: bool = RERANK,
     tag: str = "baseline",
     sanity_check: bool = True,
     time_run: bool = True,
@@ -387,7 +409,9 @@ def run_diagnostics(
         page_to_chunks = {p: np.asarray(v, dtype=np.int64) for p, v in _tmp.items()}
 
     use_fusion = scope == "page" and fusion == "rrf"
+    use_rerank = use_fusion and rerank
     bm25 = load_bm25(root) if use_fusion else None
+    chunk_texts = load_chunk_texts(root) if use_rerank else None
 
     missing_ids, n_missing = _check_missing_relevant(ground_truth, corpus_pages)
 
@@ -439,6 +463,7 @@ def run_diagnostics(
                 scope=scope, pool_k=pool_k, k_window=k_window,
                 fusion=fusion, bm25=bm25,
                 query_terms=tokenize(queries[i]) if use_fusion else None,
+                rerank=use_rerank, query=queries[i], chunk_texts=chunk_texts,
             )
             top10 = full_ranked[:K_EVAL]
 
@@ -530,6 +555,7 @@ def run_diagnostics(
             pool_k=pool_k,
             fusion=fusion,
             prf=prf,
+            rerank=use_rerank,
         )
 
     # Sanity: harness top-10 vs retrieve.search_batch (reuses timed call above).
@@ -587,6 +613,10 @@ def run_diagnostics(
         "prf_alpha": PRF_ALPHA if use_prf else None,
         "prf_topn": PRF_TOPN if use_prf else None,
         "prf_page_repr": PRF_PAGE_REPR if use_prf else None,
+        "rerank": bool(use_rerank),
+        "rerank_pool": RERANK_POOL if use_rerank else None,
+        "rerank_alpha": RERANK_ALPHA if use_rerank else None,
+        "rerank_model": RERANK_MODEL_NAME if use_rerank else None,
         "top_chunks": top_chunks,
         "k_eval": K_EVAL,
         "chunk_words": meta.get("chunk_words", CHUNK_WORDS),
@@ -662,6 +692,12 @@ def print_report_summary(report: DiagnosticReport) -> None:
             f"prf: alpha={report.config.get('prf_alpha')}  "
             f"top_n={report.config.get('prf_topn')}  "
             f"page_repr={report.config.get('prf_page_repr')}"
+        )
+    if report.config.get("rerank"):
+        print(
+            f"rerank: pool={report.config.get('rerank_pool')}  "
+            f"alpha={report.config.get('rerank_alpha')}  "
+            f"model={report.config.get('rerank_model')}"
         )
     print()
     print("=== Scoreboard (matches eval_public.py NDCG math) ===")
