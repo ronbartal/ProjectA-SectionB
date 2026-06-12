@@ -141,7 +141,7 @@ Front placement of the title is kept deliberately: truncation cuts the tail, so 
 | E4 | BM25 + dense RRF fusion. | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.2993 |
 | E4.5 | PRF - Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — **0.3113 (current)** |
 | RRF-K | Shared/asymmetric K tuning. | analysis only | **done** — K=60 validated, no change |
-| **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **implemented 2026-06-12** — 0.4394, default OFF pending GPU timing (§8 log) |
+| **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **ENABLED 2026-06-12** — 0.4394; GPU timing verified 8.58s < 60s (§8 log) |
 | E5 | Title-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **closed 2026-06-12 — negative** (both arms < 0.4274 production); see §8 |
 | follow-up | BM25 candidate generation (union BM25 top-pages with dense pool). | `retrieve.py` | exploratory — surfaced by RRF-K analysis |
 
@@ -158,8 +158,8 @@ PRF = True
 PRF_ALPHA = 0.9
 PRF_TOPN = 10
 PRF_PAGE_REPR = "mean"
-# E6 — implemented, default OFF until GPU timing verified (Ron, VM):
-RERANK = False           # flip to True if diagnose --rerank < 60s on GPU
+# E6 — ENABLED 2026-06-12 after VM GPU timing: query_phase 8.58s << 60s
+RERANK = True
 RERANK_POOL = 20
 RERANK_ALPHA = 0.3       # final = 0.3*ce_minmax + 0.7*fused_rank_norm
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -524,6 +524,8 @@ Record every experiment result here so both teammates (and agents) have context.
 | 2026-06-12 | **E6 chunk-text artifact shipped (Ron)** | `ron_e6` | n/a (artifact) | n/a | yes (artifact + loader) | `artifacts/chunk_texts.npy` built on VM via new `scripts/stage_chunk_texts.py` — no re-embed: chunking is deterministic, params read from `index_meta.json`, regenerated `(page_id, chunk_id)` sequence verified row-aligned against the dense index before writing. 521,322 passages, 479 MB (LFS), SHA256-verified after transfer. `index.build_index()` now persists texts on every future rebuild; loader `index.load_chunk_texts()` added. **Unblocks Yehoraz's E6 rerun** of `sweep_rerank_ab.py` with real text (replaces the BM25-token proxy). |
 | 2026-06-12 | **E6 CE rerank — real text, IMPLEMENTED (default OFF)** | `yehorazE6` | **0.4394** (rerank on) | **+0.0120** vs 0.4274 | yes (code; flag off) | Reran `sweep_rerank_ab.py` with real `chunk_texts.npy` (model `cross-encoder/ms-marco-MiniLM-L-6-v2`, 29 q). **Pure CE order on the pool=20 shortlist: k-fold +0.0091 but split-half UNSTABLE** (half A +0.0745, half B **−0.0527**) — same failure mode as the proxy run; CE-only discards the tuned fused ranking. Fix: **blend** `final = 0.3·ce_minmax + 0.7·fused_rank_norm` (pool=20) → full-set **0.4394**, k-fold **0.4406 ± 0.127 (+0.0115)**, split-half **stable** (half A −0.0023 ≈ noise, half B +0.0274); alpha≈0.3 was also best at pool=10 and parameter-free RRF(fused, ce) was stable-positive too — light CE influence is the consistent region (echoes the PRF light-touch lesson). **Baked**: new `rerank.py` (CE loads lazily, rerank-only per course rule), `retrieve.py` rerank stage, `utils.{RERANK, RERANK_POOL=20, RERANK_ALPHA=0.3, RERANK_MODEL_NAME}`, mirrored in `diagnostics.py`/`diagnose.py --rerank`. `diagnose --tag e6_rerank --rerank`: **sanity PASSED**, 0.4394 reproduced. **Latency is the only open gate: 75.3s on local CPU vs 60s budget** (rerank-off path: 33.8s, score 0.4274 unchanged) → `RERANK = False` by default. **Ron: run `python scripts/diagnose.py --rerank` on the VM GPU**; if `query_phase_time` < 60s, flip `utils.RERANK = True` → production 0.4394. |
 
+| 2026-06-12 | **E6 GPU timing verified — RERANK ENABLED (Ron)** | `ron_e6` | 0.4406 k-fold (GPU) | 0 (timing gate) | **yes — `utils.RERANK = True`** | Ran `diagnose.py --rerank` on the VM GPU (full pipeline, CE included): **query_phase 8.58s on the 29-query file** (12.5s on the old 50-query file) vs the 60s budget — ~7× headroom, so even a larger reranker (e.g. `bge-reranker-base`) fits if ever wanted. k-fold 0.4406 ± 0.127 matches Yehoraz's local run; sanity PASSED (`results/diag_rerank_gpu.json` on VM). CPU remains ~61s for the CE stage alone — acceptable since grading runs on GPU. Also synced the VM's stale 50-query `public_queries.json` to the fixed 29-query file. **E6 is now live in the production config.** |
+
 ### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06, updated 2026-06-07)
 
 **Factorial results (title × size):**
@@ -542,7 +544,7 @@ Record every experiment result here so both teammates (and agents) have context.
 **Agreed Ron priority (updated 2026-06-07):**
 1. **E1 + E2 complete.** Production `artifacts/`: title_150 dense + BM25.
 2. **Yehoraz E3 + E4 + PRF complete** on `yehoraz_develop` (0.3113) — not yet merged to `main`.
-3. **Ron → E6: artifact done 2026-06-12**; Yehoraz implemented the rerank same day (0.4394, flag off). **Remaining: GPU timing on VM** (`diagnose.py --rerank`).
+3. **Ron → E6: DONE 2026-06-12** — artifact shipped, Yehoraz implemented the rerank (0.4394), Ron verified GPU timing on VM (8.58s < 60s) and flipped `RERANK=True`.
 4. **Ron → E5: done 2026-06-11** — page-vector artifact built on VM, verified, in `artifacts/`. Fusion closed negative 2026-06-12 (§4.2.1, §8).
 5. Sentence-aware splitting: still deferred.
 
@@ -658,7 +660,7 @@ Record every experiment result here so both teammates (and agents) have context.
    - **E1 + E2:** done. Chunk config locked: `title_150`.
    - **E5:** done (artifact built 2026-06-11; fusion closed negative 2026-06-12).
    - **E6 artifact:** **done 2026-06-12** — `chunk_texts.npy` shipped + `load_chunk_texts()`.
-   - **E6 GPU timing (NOW — the only open gate):** Yehoraz implemented the rerank (0.4394, flag off). Run `python scripts/diagnose.py --rerank` on the VM GPU; if `query_phase_time` < 60s, flip `utils.RERANK = True` and report the timing in §8.
+   - **E6 GPU timing: done 2026-06-12** — `diagnose.py --rerank` on VM GPU: query_phase 8.58s (29 q) / 12.5s (50 q) << 60s; k-fold 0.4406, sanity PASSED. `utils.RERANK = True` flipped; recorded in §8.
    - Sentence-aware splitting: still deferred.
 5. **E6 implementation notes:**
    - Save `np.asarray([c.text for c in chunks], dtype=object)` — same strings sent to `embed_texts()`.
