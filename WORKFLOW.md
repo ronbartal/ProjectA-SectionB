@@ -142,7 +142,7 @@ Front placement of the title is kept deliberately: truncation cuts the tail, so 
 | PRF | Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — **0.3113 (current)** |
 | RRF-K | Shared/asymmetric K tuning. | analysis only | **done** — K=60 validated, no change |
 | **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **A/B done; blocked on §4.3** |
-| E5 | Title-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **unblocked 2026-06-11** — artifact in `artifacts/`; Yehoraz integrates (§4.2.1) |
+| E5 | Page-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **unblocked 2026-06-11** — artifact in `artifacts/`; Yehoraz integrates (§4.2.1) |
 | follow-up | BM25 candidate generation (union BM25 top-pages with dense pool). | `retrieve.py` | exploratory — surfaced by RRF-K analysis |
 
 **Current `utils.py` production constants (on `yehoraz_develop`, not merged to `main`):**
