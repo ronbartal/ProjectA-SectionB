@@ -18,6 +18,10 @@ over the page's chunk BM25 scores, computed over the chunks in the dense window
 PRF (utils.PRF): when enabled (page scope), a first dense pass expands the query
 via Rocchio page-level pseudo-relevance feedback, then a second pass ranks with
 the expanded query. See `_prf_expand_query`.
+
+E6 rerank (utils.RERANK): when enabled (page scope + rrf fusion), a cross-
+encoder rescores the top-`RERANK_POOL` fused pages from their best in-window
+passage text and the final order blends CE with the fused rank (rerank.py).
 """
 from __future__ import annotations
 
@@ -28,8 +32,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from embed import embed_queries
-from index import load_index
+from index import load_chunk_texts, load_index
 from lexical import Bm25Index, bm25_score_row, load_bm25, tokenize
+from rerank import rerank_pages
 from utils import (
     AGG_SCOPE,
     BM25_PAGE_AGG,
@@ -41,6 +46,7 @@ from utils import (
     PRF_ALPHA,
     PRF_PAGE_REPR,
     PRF_TOPN,
+    RERANK,
     RRF_K,
     TOP_CHUNKS,
 )
@@ -233,6 +239,7 @@ def search_batch(
     pool_k: int = PAGE_POOL_K,
     fusion: str = FUSION,
     prf: bool = PRF,
+    rerank: bool = RERANK,
 ) -> List[List[int]]:
     """
     Return ranked page_id lists (best first) for each query.
@@ -246,6 +253,10 @@ def search_batch(
     When `prf` (page scope), a first pass expands each query via Rocchio
     pseudo-relevance feedback (see `_prf_expand_query`) and a second pass ranks
     with the expanded query; BM25 keeps the original query terms.
+
+    When `rerank` (page scope + rrf), a cross-encoder rescores the fused
+    shortlist from real passage text and the final order blends CE with the
+    fused ranking (see rerank.py).
     """
     corpus_vectors, page_ids, index = load_index(artifacts_dir)
     query_vectors = embed_queries(queries)
@@ -260,10 +271,12 @@ def search_batch(
 
     use_fusion = scope == "page" and fusion == "rrf"
     use_prf = scope == "page" and prf
+    use_rerank = use_fusion and rerank
     page_to_chunks = (
         _build_page_to_chunks(page_ids) if scope == "page" else {}
     )
     bm25 = load_bm25(artifacts_dir) if use_fusion else None
+    chunk_texts = load_chunk_texts(artifacts_dir) if use_rerank else None
 
     def _search(qv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if index is not None:
@@ -308,7 +321,17 @@ def search_batch(
                 tokenize(queries[row_idx]), candidates, windowed,
                 page_to_chunks, bm25,
             )
-            ranked.append(_rrf_fuse(dense_scores, bm25_scores, RRF_K)[:top_k])
+            fused = _rrf_fuse(dense_scores, bm25_scores, RRF_K)
+            if use_rerank:
+                chunk_sim = {
+                    int(c): float(s)
+                    for c, s in zip(indices[row_idx], scores[row_idx])
+                    if int(c) >= 0
+                }
+                fused = rerank_pages(
+                    queries[row_idx], fused, windowed, chunk_sim, chunk_texts,
+                )
+            ranked.append(fused[:top_k])
         else:
             ordered = sorted(
                 dense_scores.items(), key=lambda kv: kv[1], reverse=True

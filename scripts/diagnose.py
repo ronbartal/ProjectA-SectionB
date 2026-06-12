@@ -21,6 +21,7 @@ from utils import (
     PAGE_POOL_K,
     PRF,
     PUBLIC_QUERIES_PATH,
+    RERANK,
     TOP_CHUNKS,
 )
 
@@ -83,6 +84,16 @@ def main() -> None:
         help="Disable PRF query expansion",
     )
     parser.set_defaults(prf=PRF)
+    rr_group = parser.add_mutually_exclusive_group()
+    rr_group.add_argument(
+        "--rerank", dest="rerank", action="store_true",
+        help="Enable E6 cross-encoder rerank of the fused shortlist",
+    )
+    rr_group.add_argument(
+        "--no-rerank", dest="rerank", action="store_false",
+        help="Disable E6 cross-encoder rerank",
+    )
+    parser.set_defaults(rerank=RERANK)
     parser.add_argument(
         "--tag",
         type=str,
@@ -121,6 +132,7 @@ def main() -> None:
         pool_k=args.pool_k,
         fusion=args.fusion,
         prf=args.prf,
+        rerank=args.rerank,
         tag=args.tag,
         sanity_check=not args.no_sanity,
         time_run=not args.no_time_run,

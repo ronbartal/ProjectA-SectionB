@@ -50,7 +50,7 @@ from utils import (
 )
 
 K_FOLD_SEED = 42
-A_BASELINE = 0.3113
+A_BASELINE = 0.4274  # live pipeline on the fixed 29-query file
 CHUNK_TEXTS_NAME = "chunk_texts.npy"
 
 
@@ -200,30 +200,35 @@ def main() -> None:
         windowed_lists.append(windowed)
         sim_rows.append(sim)
 
-    def eval_lists(lists: Sequence[List[int]]) -> Tuple[float, float, float]:
+    def eval_lists(lists: Sequence[List[int]]) -> Tuple[float, float, float, float, float]:
         nd = [ndcg_at_k(lst[:K_EVAL], gt[i], k=K_EVAL) for i, lst in enumerate(lists)]
         km, ks = _kfold_stats(nd, fold, args.kfold)
-        return float(np.mean(nd)), km, ks
+        arr = np.asarray(nd)
+        return float(arr.mean()), km, ks, float(arr[0::2].mean()), float(arr[1::2].mean())
 
-    a_mean, a_km, a_ks = eval_lists([f[:K_EVAL] for f in fused_lists])
+    a_mean, a_km, a_ks, a_ha, a_hb = eval_lists([f[:K_EVAL] for f in fused_lists])
     print(f"\n=== A: baseline (no CE rerank) ===")
-    print(f"  ndcg@10={a_mean:.4f}  kfold={a_km:.4f} +/-{a_ks:.4f}")
+    print(f"  ndcg@10={a_mean:.4f}  kfold={a_km:.4f} +/-{a_ks:.4f}"
+          f"  half_A={a_ha:.4f}  half_B={a_hb:.4f}")
     print(f"  reference live score={A_BASELINE}")
 
     print(f"\nLoading cross-encoder: {args.model} ...")
     from sentence_transformers import CrossEncoder
     ce = CrossEncoder(args.model)
 
-    print("\n=== B: CE rerank (Option A on shortlist) ===")
-    print(f"{'pool':>6}{'ndcg@10':>10}{'kfold':>9}{'+/-':>8}{'delta':>8}{'ce_s':>8}")
+    print("\n=== B: CE rerank on shortlist (ce = pure CE order; "
+          "rrf = RRF(fused, ce); bN = N*ce_norm + (1-N)*fused_norm) ===")
+    print(f"{'variant':>12}{'ndcg@10':>10}{'kfold':>9}{'+/-':>8}{'delta':>8}"
+          f"{'dHalfA':>9}{'dHalfB':>9}{'ce_s':>8}")
     best = (-1.0, None)
     for pool in args.pools:
+        # CE scores computed once per pool; all fusion variants reuse them.
         t0 = time.perf_counter()
-        reranked: List[List[int]] = []
+        per_q: List[Tuple[List[int], List[int], np.ndarray]] = []
         for i in range(len(rows)):
             fused = fused_lists[i]
             if not fused:
-                reranked.append([])
+                per_q.append((fused, [], np.empty(0)))
                 continue
             short = fused[:pool]
             pairs = []
@@ -236,22 +241,58 @@ def main() -> None:
                 if passage.strip():
                     pairs.append((queries[i], passage))
                     pids.append(pid)
-            if not pairs:
-                reranked.append(fused[:K_EVAL])
-                continue
-            scores = ce.predict(pairs, batch_size=64, show_progress_bar=False)
-            order = [p for p, _ in sorted(zip(pids, scores), key=lambda x: x[1], reverse=True)]
-            reranked.append(order[:K_EVAL])
+            scores = (
+                ce.predict(pairs, batch_size=64, show_progress_bar=False)
+                if pairs else np.empty(0)
+            )
+            per_q.append((fused, pids, np.asarray(scores, dtype=np.float64)))
         ce_s = time.perf_counter() - t0
-        m, km, ks = eval_lists(reranked)
-        delta = km - a_km
-        flag = ""
-        if km > best[0]:
-            best = (km, pool)
-            flag = "  <-- best B"
-        print(f"{pool:>6}{m:>10.4f}{km:>9.4f}{ks:>8.4f}{delta:>+8.4f}{ce_s:>8.1f}{flag}")
 
-    print(f"\nBest B: pool={best[1]} kfold={best[0]:.4f} (A was {a_km:.4f})")
+        def variant_lists(mode: str, alpha: float = 0.5) -> List[List[int]]:
+            out: List[List[int]] = []
+            for fused, pids, scores in per_q:
+                if not pids:
+                    out.append(fused[:K_EVAL])
+                    continue
+                ce_rank = {p: r for r, (p, _) in enumerate(
+                    sorted(zip(pids, scores), key=lambda x: x[1], reverse=True))}
+                if mode == "ce":
+                    order = sorted(pids, key=lambda p: ce_rank[p])
+                elif mode == "rrf":
+                    fr = {p: r for r, p in enumerate(fused) if p in ce_rank}
+                    order = sorted(
+                        pids,
+                        key=lambda p: -(1.0 / (RRF_K + fr[p]) + 1.0 / (RRF_K + ce_rank[p])),
+                    )
+                else:  # score blend on min-max normalized scores
+                    lo, hi = float(scores.min()), float(scores.max())
+                    ce_n = {p: ((s - lo) / (hi - lo) if hi > lo else 0.5)
+                            for p, s in zip(pids, scores)}
+                    npids = len(pids)
+                    fr = {p: r for r, p in enumerate(fused) if p in ce_n}
+                    fu_n = {p: 1.0 - fr[p] / max(npids - 1, 1) for p in ce_n}
+                    order = sorted(
+                        pids,
+                        key=lambda p: -(alpha * ce_n[p] + (1 - alpha) * fu_n[p]),
+                    )
+                tail = [p for p in fused if p not in ce_rank]
+                out.append((order + tail)[:K_EVAL])
+            return out
+
+        variants = [("ce", 0.0), ("rrf", 0.0), ("b0.3", 0.3), ("b0.5", 0.5), ("b0.7", 0.7)]
+        for vname, alpha in variants:
+            mode = vname if vname in ("ce", "rrf") else "blend"
+            m, km, ks, ha, hb = eval_lists(variant_lists(mode, alpha))
+            delta = km - a_km
+            label = f"p{pool}_{vname}"
+            flag = ""
+            if km > best[0]:
+                best = (km, label)
+                flag = "  <-- best B"
+            print(f"{label:>12}{m:>10.4f}{km:>9.4f}{ks:>8.4f}{delta:>+8.4f}"
+                  f"{ha - a_ha:>+9.4f}{hb - a_hb:>+9.4f}{ce_s:>8.1f}{flag}")
+
+    print(f"\nBest B: {best[1]} kfold={best[0]:.4f} (A was {a_km:.4f})")
     if best[0] > a_km + 0.005:
         print("Verdict: reranking likely helps (delta > +0.005 on kfold mean).")
     elif best[0] < a_km - 0.005:
