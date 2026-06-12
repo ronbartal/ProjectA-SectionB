@@ -7,6 +7,7 @@ Persists chunk + lexical artifacts (see page_index.py for E5 page-level files):
   - bm25_vocab.json   : token -> IDF (E2 lexical index for E4 fusion).
   - bm25_tf.npz       : CSR term-frequency matrix per chunk (E2).
   - bm25_meta.json    : corpus BM25 statistics (E2).
+  - chunk_texts.npy   : passage strings per chunk (E6 cross-encoder rerank).
   - page_vectors.npy  : float32 (n_pages x 384) — built via scripts/build_page_index.py
   - page_meta.json    : page_id list + E5 recipe metadata
 
@@ -43,6 +44,7 @@ from utils import (
 INDEX_VECTORS_NAME = "index_vectors.npy"
 INDEX_META_NAME = "index_meta.json"
 INDEX_FAISS_NAME = "index.faiss"
+CHUNK_TEXTS_NAME = "chunk_texts.npy"
 
 
 def build_index(
@@ -82,6 +84,10 @@ def build_index(
         prefix_title=prefix_title,
     )
     texts = [c.text for c in chunks]
+    # E6: persist the exact strings sent to embed_texts() so the cross-encoder
+    # reranker can score (query, passage) pairs at query time. Row i aligns
+    # with index_vectors row i / BM25 CSR row i / meta page_ids[i].
+    np.save(out_dir / CHUNK_TEXTS_NAME, np.asarray(texts, dtype=object))
     build_bm25_artifacts(
         chunks,
         out_dir,
@@ -173,11 +179,25 @@ def load_bm25_index(artifacts_dir: Optional[Path] = None):
     return load_bm25(artifacts_dir)
 
 
+def load_chunk_texts(artifacts_dir: Optional[Path] = None) -> np.ndarray:
+    """Load chunk passage texts (E6 rerank); chunk_texts[i] aligns with
+    index_vectors row i / BM25 CSR row i / meta page_ids[i]."""
+    root = artifacts_dir or ARTIFACTS_DIR
+    path = root / CHUNK_TEXTS_NAME
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing {path.name} in {root}. Build it offline with "
+            "scripts/build_index.py or scripts/stage_chunk_texts.py."
+        )
+    return np.load(path, allow_pickle=True)
+
+
 # Re-export for retrieve.py: from index import load_page_index, PageIndex
 __all__ = [
     "build_index",
     "load_index",
     "load_bm25_index",
+    "load_chunk_texts",
     "load_page_index",
     "PageIndex",
 ]
