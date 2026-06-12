@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from embed import embed_queries
-from eval import K_EVAL, dcg_at_k, load_query_file, ndcg_at_k
+from eval import K_EVAL, load_query_file, ndcg_at_k
 from index import load_index
 from lexical import Bm25Index, bm25_score_row, load_bm25, tokenize
 from utils import (
@@ -311,63 +311,6 @@ def _check_missing_relevant(
     return sorted(missing), len(missing)
 
 
-def _duplicate_query_analysis(
-    rows: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Find duplicate query strings with differing relevant sets."""
-    by_text: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        by_text[row["query"]].append(row)
-
-    duplicates = []
-    for text, group in by_text.items():
-        if len(group) <= 1:
-            continue
-        sets = [g["relevant_page_ids"] for g in group]
-        all_same = all(s == sets[0] for s in sets[1:])
-        if not all_same:
-            union = set()
-            for s in sets:
-                union |= s
-            duplicates.append(
-                {
-                    "query": text,
-                    "query_ids": [g["query_id"] for g in group],
-                    "n_instances": len(group),
-                    "n_unique_sets": len({frozenset(s) for s in sets}),
-                    "union_size": len(union),
-                    "sets": [sorted(s) for s in sets],
-                }
-            )
-    return {
-        "duplicate_query_strings": len(
-            [t for t, g in by_text.items() if len(g) > 1]
-        ),
-        "duplicate_with_differing_sets": len(duplicates),
-        "details": duplicates,
-    }
-
-
-def _union_oracle_ndcg(
-    rows: List[Dict[str, Any]],
-    ranked_by_query_id: Dict[str, List[int]],
-) -> float:
-    """Upper-bound NDCG if each duplicate query string used the union of labels."""
-    by_text: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        by_text[row["query"]].append(row)
-
-    scores: List[float] = []
-    for text, group in by_text.items():
-        union_rel: Set[int] = set()
-        for g in group:
-            union_rel |= g["relevant_page_ids"]
-        # Same ranking for all instances of this query string.
-        ranked = ranked_by_query_id[group[0]["query_id"]]
-        scores.append(ndcg_at_k(ranked, union_rel, k=K_EVAL))
-    return float(sum(scores) / len(scores)) if scores else 0.0
-
-
 def measure_query_phase_time(
     queries: List[str],
     *,
@@ -447,7 +390,6 @@ def run_diagnostics(
     bm25 = load_bm25(root) if use_fusion else None
 
     missing_ids, n_missing = _check_missing_relevant(ground_truth, corpus_pages)
-    dup_info = _duplicate_query_analysis(rows)
 
     query_vectors = embed_queries(queries)
     if query_vectors.size == 0:
@@ -480,7 +422,6 @@ def run_diagnostics(
 
     per_query: List[QueryDiagnostics] = []
     ranked_top10: List[List[int]] = []
-    ranked_full: Dict[str, List[int]] = {}
     ndcg_scores: List[float] = []
 
     for i, row in enumerate(rows):
@@ -502,7 +443,6 @@ def run_diagnostics(
             top10 = full_ranked[:K_EVAL]
 
         ranked_top10.append(top10)
-        ranked_full[row["query_id"]] = full_ranked
 
         ndcg = ndcg_at_k(top10, rel, k=K_EVAL)
         ndcg_scores.append(ndcg)
@@ -577,8 +517,6 @@ def run_diagnostics(
         "mean_ndcg_at_10": float(np.mean(fold_mean_list)),
         "std_ndcg_at_10": float(np.std(fold_mean_list, ddof=0)),
     }
-
-    union_oracle = _union_oracle_ndcg(rows, ranked_full)
 
     # Graded query path: timed run() equivalent (embed + FAISS retrieve).
     query_timing: Dict[str, Any] = {}
@@ -660,10 +598,6 @@ def run_diagnostics(
     data_quality = {
         "missing_relevant_ids": missing_ids,
         "n_missing_relevant_ids": n_missing,
-        "duplicate_queries": dup_info,
-        "union_oracle_mean_ndcg_at_10": union_oracle,
-        "reported_mean_ndcg_at_10": summary["mean_ndcg_at_10"],
-        "oracle_minus_reported": union_oracle - summary["mean_ndcg_at_10"],
     }
 
     return DiagnosticReport(
@@ -762,13 +696,6 @@ def print_report_summary(report: DiagnosticReport) -> None:
     print()
     print("=== Data quality ===")
     print(f"missing_relevant_ids={dq['n_missing_relevant_ids']}")
-    dup = dq["duplicate_queries"]
-    print(
-        f"duplicate_query_strings={dup['duplicate_query_strings']}  "
-        f"differing_sets={dup['duplicate_with_differing_sets']}"
-    )
-    print(f"union_oracle_ndcg@10={dq['union_oracle_mean_ndcg_at_10']:.4f}  "
-          f"(+{dq['oracle_minus_reported']:.4f} vs reported)")
     print()
     print("=== Sanity (harness top-10 vs retrieve.search_batch) ===")
     if report.sanity["passed"]:
