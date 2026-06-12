@@ -14,18 +14,20 @@ A semantic retrieval pipeline over **~27 074 Wikipedia pages** (full corpus on R
 The grader calls `main.run(queries)` once with all evaluation queries.
 Only the first 10 page_ids per query are scored (NDCG@10, binary relevance).
 
-### Current status (2026-06-07, branch `yehoraz_develop`)
+### Current status (2026-06-12, branch `ron_e6`)
 
 | Layer | Status | NDCG@10 |
 |-------|--------|---------|
-| Baseline (E1+E2 dense only) | locked on `main` artifacts | 0.1332 |
-| **E3** page-scope mean-all | done, not merged | 0.2476 |
-| **E4** BM25 + dense RRF | done, not merged | 0.2993 |
-| **PRF** Rocchio query expansion | done, not merged | **0.3113** ← **current production config on `yehoraz_develop`** |
-| **E6** cross-encoder rerank | **IMPLEMENTED 2026-06-12** (real text) — `rerank.py` wired into `retrieve.py` behind `utils.RERANK`, **default OFF**: 75s on local CPU vs 60s budget. Score + stability gates PASS. | **0.4394** with rerank on (vs 0.4274 off) |
-| **E5** title-vector fusion | **closed 2026-06-12 — negative** (best 0.4007 < 0.4274 baseline on fixed queries); see §8 decision log | — |
+| Baseline (E1+E2 dense only) | locked on `main` artifacts | 0.1332 (old 50-q file) |
+| **E3** page-scope mean-all + **E4** RRF + **PRF** | merged to `main` (PR #9) | 0.4274 (fixed 29-q file, rerank off) |
+| **E6** cross-encoder rerank | **ENABLED 2026-06-12** — `utils.RERANK = True` after VM GPU timing: query_phase **8.58s** << 60s. Score + stability + timing gates all PASS. | **0.4394** ← **current production config** |
+| **E5** title-vector fusion | **closed 2026-06-12 — negative** (best 0.4007 < 0.4274); see §8 decision log | — |
 
-**Next gate for score improvement:** Ron times `python scripts/diagnose.py --rerank` on the VM **GPU** → if `query_phase_time` < 60s, flip `utils.RERANK = True` (one-line change) and production becomes 0.4394.
+**Next directions for score improvement (priority order, one variable at a time, §8 merge bar applies):**
+1. **CE model upgrade:** swap `RERANK_MODEL_NAME` to `BAAI/bge-reranker-base` (fallback `cross-encoder/ms-marco-MiniLM-L-12-v2`) — single-constant A/B via `sweep_rerank_ab.py --model`. GPU headroom is ~7×, so latency is not a concern; re-verify timing on VM anyway (Ron).
+2. **BM25 candidate generation:** union BM25 top-pages into the dense candidate pool to lift the recall ceiling (recall@100 ≈ 0.67 caps everything downstream) — surfaced by the RRF-K analysis, never tested.
+3. **Multi-chunk page representation in rerank:** score the top 2–3 in-window chunks per page with the CE, take max — only if (1)/(2) stall; costs pairs ∝ chunks.
+4. **Stop tuning** `RERANK_POOL`/`RERANK_ALPHA` further — alpha 0.3 / pool 20 was the stable region across pools; more sweeps on 29 queries = overfit (§8 lessons).
 
 ### Pipeline stages
 
@@ -40,7 +42,7 @@ Only the first 10 page_ids per query are scored (NDCG@10, binary relevance).
     → MiniLM embed (+ optional PRF expand)          [Yehoraz: retrieve.py]
     → FAISS top-500 chunks → page candidates
     → page-scope dense mean-all + BM25-max + RRF
-    → (optional) cross-encoder rerank top-M pages   [blocked until §4.3]
+    → cross-encoder rerank of top-20 fused pages    [E6, enabled — rerank.py]
     → top-10 page_ids
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   Yehoraz owns: retrieve.py (+ rerank.py when enabled), utils.py constants
@@ -139,9 +141,9 @@ Front placement of the title is kept deliberately: truncation cuts the tail, so 
 |----|-----------|---------------|--------|
 | E3 | Page-scope mean-all aggregation; `TOP_CHUNKS` 500. | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.2476 |
 | E4 | BM25 + dense RRF fusion. | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.2993 |
-| E4.5 | PRF - Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — **0.3113 (current)** |
+| E4.5 | PRF - Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — in production stack |
 | RRF-K | Shared/asymmetric K tuning. | analysis only | **done** — K=60 validated, no change |
-| **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **implemented 2026-06-12** — 0.4394, default OFF pending GPU timing (§8 log) |
+| **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **ENABLED 2026-06-12** — 0.4394; GPU timing verified 8.58s < 60s (§8 log) |
 | E5 | Title-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **closed 2026-06-12 — negative** (both arms < 0.4274 production); see §8 |
 | follow-up | BM25 candidate generation (union BM25 top-pages with dense pool). | `retrieve.py` | exploratory — surfaced by RRF-K analysis |
 
@@ -158,8 +160,8 @@ PRF = True
 PRF_ALPHA = 0.9
 PRF_TOPN = 10
 PRF_PAGE_REPR = "mean"
-# E6 — implemented, default OFF until GPU timing verified (Ron, VM):
-RERANK = False           # flip to True if diagnose --rerank < 60s on GPU
+# E6 — ENABLED 2026-06-12 after VM GPU timing: query_phase 8.58s << 60s
+RERANK = True
 RERANK_POOL = 20
 RERANK_ALPHA = 0.3       # final = 0.3*ce_minmax + 0.7*fused_rank_norm
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -308,7 +310,7 @@ If B ≥ A with E5 on, promote `notitle_150` to production `artifacts/` (Ron doe
 ### 4.3  Chunk text artifact (E6 → cross-encoder reranking)
 
 > **Status: BUILT 2026-06-12** via `scripts/stage_chunk_texts.py` (no re-embed — chunking is deterministic, regenerated texts verified row-aligned against `index_meta.json` before writing). 521,322 passages, 479 MB, in `artifacts/` via LFS. Loader: `index.load_chunk_texts()`.
-> **UPDATE 2026-06-12 (later) — E6 IMPLEMENTED by Yehoraz (see §8 log):** real-text A/B passed score (+0.0115 k-fold) and split-half gates with the **alpha=0.3 CE/fused blend** (pure CE order was unstable). `rerank.py` + `retrieve.py` wiring + `diagnostics.py` mirror are committed; `utils.RERANK = False` (default OFF) because local CPU timing is 75.3s vs the 60s budget. **Remaining gate: Ron runs `python scripts/diagnose.py --rerank` on the VM GPU** — if < 60s, flip `RERANK = True` → production 0.4394.
+> **UPDATE 2026-06-12 (later) — E6 IMPLEMENTED by Yehoraz (see §8 log):** real-text A/B passed score (+0.0115 k-fold) and split-half gates with the **alpha=0.3 CE/fused blend** (pure CE order was unstable). `rerank.py` + `retrieve.py` wiring + `diagnostics.py` mirror are committed; `utils.RERANK = False` (default OFF) because local CPU timing is 75.3s vs the 60s budget. **GATE CLEARED 2026-06-12 (Ron):** `diagnose.py --rerank` on the VM GPU = **query_phase 8.58s** → `utils.RERANK = True` flipped, **production is 0.4394**. E6 complete.
 
 #### Why the existing index is not enough
 
@@ -378,7 +380,7 @@ Query-time pipeline (current + E6):
 **Merge criteria (Yehoraz, before enabling in production) — status 2026-06-12:**
 - [x] `sweep_rerank_ab.py` with real `chunk_texts.npy`: k-fold gain ≥ +0.005 **and** split-half stable — PASSED by the alpha=0.3 blend (+0.0115; halves −0.0023/+0.0274). Pure CE order FAILED stability and is not used.
 - [x] `diagnose.py` sanity PASSED with `--rerank` (0.4394 reproduced).
-- [ ] `query_phase_time` < 60s on grading hardware — **75.3s local CPU → default OFF; Ron verifies on VM GPU.**
+- [x] `query_phase_time` < 60s on grading hardware — **8.58s on VM GPU (2026-06-12)**; 75.3s local CPU is irrelevant (grading is GPU).
 
 #### E6 A/B results so far (proxy text — do not merge)
 
@@ -390,7 +392,7 @@ Query-time pipeline (current + E6):
 
 **Split-half (pool=20):** half-A +0.068, half-B −0.034 → **unstable; rerun required with real text.**
 
-**Latency (CPU, CE only):** pool=20 ≈ 47s; full pipeline ≈ 67–72s → **over 60s budget on CPU.** Grader GPU timing TBD.
+**Latency (CPU, CE only):** pool=20 ≈ 47s; full pipeline ≈ 67–72s → **over 60s budget on CPU.** ~~Grader GPU timing TBD~~ → **GPU verified 2026-06-12: full query_phase 8.58s** (§8 log); the table above is the superseded proxy-text run — see the 2026-06-12 real-text entry in §8 for current numbers.
 
 > **Important:** If this format changes, Ron rebuilds on the VM, commits, and notifies Yehoraz to `git pull`.
 
@@ -480,13 +482,12 @@ Ron is the sole committer of LFS blobs. Yehoraz: `git lfs pull` after every pull
 - [x] Merge Yehoraz stack (E3+E4+PRF+E5 closure) to `main` (PR #9, 2026-06-12)
 - [x] **Ron → E6:** build `chunk_texts.npy` (§8.4) — shipped (PR #10, 2026-06-12)
 - [x] **Yehoraz:** rerun A/B with real text; **E6 implemented** (alpha=0.3 blend, 0.4394, default OFF — §8 log)
-- [ ] **Ron: verify `diagnose.py --rerank` timing on VM GPU** — flips `utils.RERANK=True` if < 60s → **next single highest-value action**
+- [x] **Ron: verify `diagnose.py --rerank` timing on VM GPU** — 8.58s << 60s → **`utils.RERANK=True` flipped 2026-06-12** (§8 log)
 
 ### Day 6 — Hardening (future work)
-- [ ] Merge `yehorazE6` (rerank code, flag off) to `main` after Ron's GPU timing verdict
-- [ ] If GPU > 60s: try cheaper CE paths before giving up — smaller pool (10–15), passage truncation (256 tok), ONNX/quantized CE
-- [ ] Optional score lever (exploratory): BM25 candidate *generation* (union BM25 top pages into the dense candidate pool) — surfaced by RRF-K analysis, never tested
-- [ ] Optional CE model upgrade: `BAAI/bge-reranker-base` A/B — only if GPU budget is comfortable
+- [ ] Merge `ron_e6` (artifact + rerank enabled) to `main`
+- [ ] CE model upgrade (Yehoraz, first priority): `BAAI/bge-reranker-base` A/B — GPU headroom is ~7×, latency not a concern
+- [ ] Score lever (Yehoraz, second priority): BM25 candidate *generation* (union BM25 top pages into the dense candidate pool) — surfaced by RRF-K analysis, never tested
 - [ ] Fresh-clone reproducibility test (incl. LFS pulls of `chunk_texts.npy` 479 MB)
 - [ ] Edge cases: empty pages, queries returning < 10 results
 - [ ] No further knob tuning on the 29 public queries (overfit risk — split-half lessons in §8)
@@ -524,6 +525,8 @@ Record every experiment result here so both teammates (and agents) have context.
 | 2026-06-12 | **E6 chunk-text artifact shipped (Ron)** | `ron_e6` | n/a (artifact) | n/a | yes (artifact + loader) | `artifacts/chunk_texts.npy` built on VM via new `scripts/stage_chunk_texts.py` — no re-embed: chunking is deterministic, params read from `index_meta.json`, regenerated `(page_id, chunk_id)` sequence verified row-aligned against the dense index before writing. 521,322 passages, 479 MB (LFS), SHA256-verified after transfer. `index.build_index()` now persists texts on every future rebuild; loader `index.load_chunk_texts()` added. **Unblocks Yehoraz's E6 rerun** of `sweep_rerank_ab.py` with real text (replaces the BM25-token proxy). |
 | 2026-06-12 | **E6 CE rerank — real text, IMPLEMENTED (default OFF)** | `yehorazE6` | **0.4394** (rerank on) | **+0.0120** vs 0.4274 | yes (code; flag off) | Reran `sweep_rerank_ab.py` with real `chunk_texts.npy` (model `cross-encoder/ms-marco-MiniLM-L-6-v2`, 29 q). **Pure CE order on the pool=20 shortlist: k-fold +0.0091 but split-half UNSTABLE** (half A +0.0745, half B **−0.0527**) — same failure mode as the proxy run; CE-only discards the tuned fused ranking. Fix: **blend** `final = 0.3·ce_minmax + 0.7·fused_rank_norm` (pool=20) → full-set **0.4394**, k-fold **0.4406 ± 0.127 (+0.0115)**, split-half **stable** (half A −0.0023 ≈ noise, half B +0.0274); alpha≈0.3 was also best at pool=10 and parameter-free RRF(fused, ce) was stable-positive too — light CE influence is the consistent region (echoes the PRF light-touch lesson). **Baked**: new `rerank.py` (CE loads lazily, rerank-only per course rule), `retrieve.py` rerank stage, `utils.{RERANK, RERANK_POOL=20, RERANK_ALPHA=0.3, RERANK_MODEL_NAME}`, mirrored in `diagnostics.py`/`diagnose.py --rerank`. `diagnose --tag e6_rerank --rerank`: **sanity PASSED**, 0.4394 reproduced. **Latency is the only open gate: 75.3s on local CPU vs 60s budget** (rerank-off path: 33.8s, score 0.4274 unchanged) → `RERANK = False` by default. **Ron: run `python scripts/diagnose.py --rerank` on the VM GPU**; if `query_phase_time` < 60s, flip `utils.RERANK = True` → production 0.4394. |
 
+| 2026-06-12 | **E6 GPU timing verified — RERANK ENABLED (Ron)** | `ron_e6` | 0.4406 k-fold (GPU) | 0 (timing gate) | **yes — `utils.RERANK = True`** | Ran `diagnose.py --rerank` on the VM GPU (full pipeline, CE included): **query_phase 8.58s on the 29-query file** (12.5s on the old 50-query file) vs the 60s budget — ~7× headroom, so even a larger reranker (e.g. `bge-reranker-base`) fits if ever wanted. k-fold 0.4406 ± 0.127 matches Yehoraz's local run; sanity PASSED (`results/diag_rerank_gpu.json` on VM). CPU remains ~61s for the CE stage alone — acceptable since grading runs on GPU. Also synced the VM's stale 50-query `public_queries.json` to the fixed 29-query file. **E6 is now live in the production config.** |
+
 ### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06, updated 2026-06-07)
 
 **Factorial results (title × size):**
@@ -542,7 +545,7 @@ Record every experiment result here so both teammates (and agents) have context.
 **Agreed Ron priority (updated 2026-06-07):**
 1. **E1 + E2 complete.** Production `artifacts/`: title_150 dense + BM25.
 2. **Yehoraz E3 + E4 + PRF complete** on `yehoraz_develop` (0.3113) — not yet merged to `main`.
-3. **Ron → E6: artifact done 2026-06-12**; Yehoraz implemented the rerank same day (0.4394, flag off). **Remaining: GPU timing on VM** (`diagnose.py --rerank`).
+3. **Ron → E6: DONE 2026-06-12** — artifact shipped, Yehoraz implemented the rerank (0.4394), Ron verified GPU timing on VM (8.58s < 60s) and flipped `RERANK=True`.
 4. **Ron → E5: done 2026-06-11** — page-vector artifact built on VM, verified, in `artifacts/`. Fusion closed negative 2026-06-12 (§4.2.1, §8).
 5. Sentence-aware splitting: still deferred.
 
@@ -638,16 +641,17 @@ Record every experiment result here so both teammates (and agents) have context.
 4. **Do not** rebuild or overwrite anything in `artifacts/` — treat as read-only. **Exception:** consume `chunk_texts.npy` once Ron commits it.
 5. **Available data:** `artifacts/` (dense + BM25 + `chunk_texts.npy` + page vectors) and `data/public_queries.json`. Raw corpus not available.
 6. **Test changes:** `python scripts/eval_public.py` (canonical score) **and** `python scripts/diagnose.py --tag <name>` (sanity + timing). Sanity must PASS.
-7. **Current production config (§3.2):** E3 page-scope mean-all + E4 RRF + PRF → **0.3113**. Do not regress without documenting in §8.
+7. **Current production config (§3.2):** E3 page-scope mean-all + E4 RRF + PRF + E6 CE rerank (`RERANK=True`) → **0.4394**. Do not regress without documenting in §8.
 8. **E5 page-vector fusion: CLOSED 2026-06-12 (negative)** — both arms lose to `title_150` production 0.4274; see §8 decision log. Artifact stays in `artifacts/` for reference; no further sweeps.
-9. **Next priority — E6 rerank (UNBLOCKED 2026-06-12):**
-   - `artifacts/chunk_texts.npy` is shipped (§4.3); load via `index.load_chunk_texts()`.
-   - Rerun `python scripts/sweep_rerank_ab.py` with real text (replaces BM25-token proxy).
-   - If stable + fast: implement Option A CE rerank (`RERANK_POOL≈20`, `cross-encoder/ms-marco-MiniLM-L-6-v2`).
-   - Additional pretrained models **only for reranking** — never replace MiniLM for indexing.
-10. **Exploratory (lower priority):** BM25 candidate generation (union BM25 top-pages with dense pool).
-10. **Latency:** 60s query-phase budget. CE rerank was ~47s CPU alone — profile on GPU before merging.
-11. **Always** record before/after NDCG@10 in §8 decision log.
+9. **E6 rerank: DONE & ENABLED 2026-06-12** — alpha=0.3 CE/fused blend, pool=20, GPU query_phase 8.58s. Do not re-tune `RERANK_POOL`/`RERANK_ALPHA` (stable region already found; more sweeps on 29 queries overfit).
+10. **Next priority — CE model upgrade (single-variable A/B):**
+    - Swap `RERANK_MODEL_NAME` to `BAAI/bge-reranker-base` (fallback `cross-encoder/ms-marco-MiniLM-L-12-v2`); test via `python scripts/sweep_rerank_ab.py --model <name>`.
+    - Merge bar: k-fold gain vs 0.4394, split-half stable in both halves, Ron re-verifies GPU timing on VM.
+    - Additional pretrained models **only for reranking** — never replace MiniLM for indexing.
+11. **Second priority — BM25 candidate generation:** union BM25 top-pages into the dense candidate pool to lift the recall ceiling (recall@100 ≈ 0.67). Exploratory; same merge bar.
+12. **Third (only if 10–11 stall) — multi-chunk rerank:** CE-score top 2–3 in-window chunks per page, take max; trades pairs against pool under the 60s budget.
+13. **Latency:** 60s query-phase budget, measured on GPU (grading hardware). Current pipeline: 8.58s. CPU is ~10× slower on the CE stage — develop on CPU, but timing verdicts come from the VM GPU (ask Ron).
+14. **Always** record before/after NDCG@10 in §8 decision log.
 
 ### If you are Ron's agent:
 
@@ -658,7 +662,7 @@ Record every experiment result here so both teammates (and agents) have context.
    - **E1 + E2:** done. Chunk config locked: `title_150`.
    - **E5:** done (artifact built 2026-06-11; fusion closed negative 2026-06-12).
    - **E6 artifact:** **done 2026-06-12** — `chunk_texts.npy` shipped + `load_chunk_texts()`.
-   - **E6 GPU timing (NOW — the only open gate):** Yehoraz implemented the rerank (0.4394, flag off). Run `python scripts/diagnose.py --rerank` on the VM GPU; if `query_phase_time` < 60s, flip `utils.RERANK = True` and report the timing in §8.
+   - **E6 GPU timing: done 2026-06-12** — `diagnose.py --rerank` on VM GPU: query_phase 8.58s (29 q) / 12.5s (50 q) << 60s; k-fold 0.4406, sanity PASSED. `utils.RERANK = True` flipped; recorded in §8.
    - Sentence-aware splitting: still deferred.
 5. **E6 implementation notes:**
    - Save `np.asarray([c.text for c in chunks], dtype=object)` — same strings sent to `embed_texts()`.
