@@ -21,7 +21,7 @@ Only the first 10 page_ids per query are scored (NDCG@10, binary relevance).
 | Baseline (E1+E2 dense only) | locked on `main` artifacts | 0.1332 |
 | **E3** page-scope mean-all | done, not merged | 0.2476 |
 | **E4** BM25 + dense RRF | done, not merged | 0.2993 |
-| **PRF** Rocchio query expansion | done, not merged | **0.3113** ← **current production config on `yehoraz_develop`** |
+| **E4.5** PRF Rocchio query expansion | done, not merged | 0.3113 (old data) = **0.4274 on fixed 29-q data** ← **current production config on `yehoraz_develop`** |
 | **E6** cross-encoder rerank | A/B tested, **blocked** — needs `chunk_texts.npy` from Ron + GPU timing check | 0.3284 (proxy text; not shippable) |
 | **E5** title-vector fusion | blocked on Ron artifact | — |
 
@@ -139,10 +139,10 @@ Front placement of the title is kept deliberately: truncation cuts the tail, so 
 |----|-----------|---------------|--------|
 | E3 | Page-scope mean-all aggregation; `TOP_CHUNKS` 500. | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.2476 |
 | E4 | BM25 + dense RRF fusion. | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.2993 |
-| PRF | Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — **0.3113 (current)** |
+| E4.5 | PRF — Rocchio page-level query expansion (query-side, while E5 blocked). | `retrieve.py`, `utils.py`, `diagnostics.py` | **done** — 0.3113 on old 50-q data = **0.4274 on fixed 29-q data (current)** |
 | RRF-K | Shared/asymmetric K tuning. | analysis only | **done** — K=60 validated, no change |
 | **E6** | Cross-encoder rerank (Option A) on RRF shortlist. | `rerank.py`, `retrieve.py`, `diagnostics.py` | **A/B done; blocked on §4.3** |
-| E5 | Page-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **unblocked 2026-06-11** — artifact in `artifacts/`; Yehoraz integrates (§4.2.1) |
+| E5 | Page-vector fusion — Ron artifact + blend at query time. | `retrieve.py` (Yehoraz) | **swept 2026-06-12 — negative, not integrated** (§4.2.1, §8); pending only arm-B+BM25 rerun after Ron fixes variant `bm25_tf.npz` |
 | follow-up | BM25 candidate generation (union BM25 top-pages with dense pool). | `retrieve.py` | exploratory — surfaced by RRF-K analysis |
 
 **Current `utils.py` production constants (on `yehoraz_develop`, not merged to `main`):**
@@ -251,7 +251,7 @@ q_terms = tokenize(query)  # original query; not PRF-expanded
 ### 4.2.1  Page-level embeddings (E5)
 
 > **Status: BUILT 2026-06-11** on the VM (full corpus) and verified locally — **27,074 pages**, full coverage of every `page_id` in the chunk index, 0 empty-text pages, L2-normalized. Lives in `artifacts/` (`page_vectors.npy` ~40 MB via LFS, `page_meta.json` plain JSON). **Chunk-config independent** — one copy shared across all variant dirs. No second FAISS index; query-time lookup by `page_id`.
-> **Ball is now with Yehoraz** — integration in `retrieve.py` (see below).
+> **UPDATE 2026-06-12 — swept by Yehoraz, NEGATIVE result (see §8 log):** every fusion config regressed vs the 0.4274 anchor on `title_150`; on `notitle_150` the page vector helps (+0.011) but the total still loses to `title_150`. **Not integrated.** Remaining open item: arm B with BM25 — blocked because `artifacts_variants/notitle_150/bm25_tf.npz` is **truncated as committed** (valid zip header, missing end-of-archive; LFS oid matches the pointer, so it's not a download issue). **Ron: rebuild it on the VM** with `python scripts/stage_bm25.py artifacts_variants/notitle_150` and re-commit. Rerun then: `python scripts/sweep_e5.py --artifacts-dir artifacts_variants/notitle_150 --split-half`.
 
 | File | Format | Contents |
 |------|--------|----------|
@@ -514,6 +514,7 @@ Record every experiment result here so both teammates (and agents) have context.
 | 2026-06-07 | **E4 BM25 + dense RRF fusion** | `yehoraz_develop` | **0.2993** | **+0.1661** | no (on `yehoraz_develop`) | **Reciprocal Rank Fusion** of the E3 dense page ranking with a BM25 page ranking (`FUSION="rrf"`, `RRF_K=60`). BM25 page score = **max** over the page's chunk BM25 scores (best-matching passage; `BM25_PAGE_AGG="max"`), computed only over the page's chunks **inside the dense window** (`BM25_SCOPE="window"`) — `page` scope (all chunks) was only +0.0095 (within ±0.095 noise) but ~15-20× more BM25 work and risked the 60s budget. Swept fusion (RRF vs weighted-sum) × agg (max/sum/mean) × scope (window/page) × params with `scripts/sweep_e4.py`: RRF+max won and is **insensitive to k (10-100 all ≈0.309)**; `sum` collapses (long-page bias); pure-dense (α=1) reproduces 0.2476 (harness sanity). 5-fold **0.2993 ± 0.095** vs E3 0.2476. recall@10 0.36→0.43, queries-with-hit 23→28, n_rel=1 bucket ndcg 0.44. `eval_public.py`=0.2993 (query 19.5s), `diagnose --tag e4_rrf` sanity **PASSED**, query_phase 24.9s CPU incl. 393M BM25 load (OK <60s). Touches `retrieve.py` (`_rrf_fuse`/`_page_bm25_scores`/`_collect_candidates`) + `utils.{FUSION,RRF_K,BM25_PAGE_AGG,BM25_SCOPE}`. **Shared harness updated:** `diagnostics.py`/`diagnose.py` are fusion-aware (`--fusion`, BM25-mirroring `aggregate_to_pages`). Headroom: union-oracle ceiling 0.418. |
 | 2026-06-07 | **PRF query expansion (Rocchio, page-level)** | `yehoraz_develop` | **0.3113** | **+0.1781** | no (on `yehoraz_develop`) | **Two-pass pseudo-relevance feedback** on the dense query (`PRF=True`, `PRF_ALPHA=0.9`, `PRF_TOPN=10`, `PRF_PAGE_REPR="mean"`): first pass picks the top-10 pseudo-relevant **pages**, each represented by its **mean chunk vector**; their centroid expands the query `q' = norm(0.9·q + 0.1·centroid)`; second pass ranks with `q'`. BM25/RRF unchanged (original query terms). Done while E5 blocked on Ron — entirely query-side. Swept level (chunk/page) × repr (mean/best) × α × N with `scripts/sweep_prf.py`: **page-level decisively beat chunk-level** (every chunk config ≤ no-PRF, down to 0.218 — redundant chunks of one page drift the centroid); **light expansion (α=0.9) won**; α=1.0 reproduces 0.2993 (sanity). Picked the **conservative** config (mean/N=10), not the literal top (best/N=20=0.3129), to avoid overfit; top region (α=0.9, N=10-20, both reprs) stable at 0.310-0.313. 5-fold **0.3113 ± 0.083** (tighter than E4's ±0.095). PRF's second pass lifts **recall too** (recall@100 0.638→0.675, queries-with-hit 28→31) — attacks the candidate-set ceiling that reorder-only fusion can't. `eval_public.py`=0.3113 (query 15.6s), `diagnose --tag prf_page_mean` sanity **PASSED**, query_phase 23.1s (OK). Touches `retrieve.py` (`_prf_expand_query` + two-pass in `search_batch`) + `utils.{PRF,PRF_ALPHA,PRF_TOPN,PRF_PAGE_REPR}`. **Shared harness updated:** `diagnostics.py`/`diagnose.py` are PRF-aware (`--prf`/`--no-prf`, importing `_prf_expand_query` to mirror production). Headroom: union-oracle ceiling 0.427. |
 | 2026-06-07 | RRF K-tuning analysis (no change) | `yehoraz_develop` | 0.3113 | 0 | n/a (validated current) | Investigated whether `RRF_K=60` is optimal and whether an **asymmetric** RRF (different K per ranker) is justified. On the shared candidate set: fusion (0.310) beats both singles — semantic-alone 0.2554 (±0.107), **BM25-alone 0.2774 (±0.044)**; BM25 is the more reliable single ranker (MRR 0.325 vs 0.291; head-to-head 20 vs 13). Shared-K is a **smooth flat plateau** k=10→1000 (0.3102-0.3107) → k=60 confirmed. Fine asymmetric grid (k_d,k_b ∈ 40-70) showed a *jagged* surface with apparent BM25-favored peaks (e.g. (70,55)=0.3142), but a **split-half held-out test debunked it**: cell tuned on half A → held-out B = 0.3023 vs symmetric 0.3300 (−0.028); best cell differs per half ((70,40) vs (70,55)). **Asymmetric K overfits the public 50 → rejected; kept symmetric K=60.** Real lever surfaced instead: BM25 candidate generation (union with dense candidates) to lift recall ceiling. Analysis only (`sweep_rrf_k.py`, since removed); no code/score change. |
+| 2026-06-12 | **E5 page-vector fusion (no change)** | `yehorazE5` | 0.4274 | 0 | n/a (negative result) | Swept Ron's page vectors into the live pipeline per §4.2.1 with `scripts/sweep_e5.py` (signals cached once; configs free): **3-way RRF** (dense+BM25+pv), **weighted blend** `a·dense+(1-a)·pv` (a∈0.3-0.9), pv vs **original and PRF-expanded** query, on **both** chunk indices. Anchor reproduced exactly (0.4274). **Every E5 config regressed on production `title_150`**: best blend0.9=0.4061, rrf3=0.3956, pv-alone≈0.30. Title-redundancy confirmed: on `title_150` dense-only (no BM25) anchor 0.3602 > best pv-config 0.3526. **Arm B (`notitle_150`)**: pv does help there (dense 0.3383 → blend0.8 0.3491, +0.011) but still **loses to title_150 dense-only (0.3602)** → no case for promoting `notitle_150`. Interpretation: page vector (title+first/last sentence) is redundant — title already in every `title_150` chunk, and E3 page-mean-all already captures page-level aboutness. **No code change; `RRF_K=60` pipeline stays at 0.4274.** Caveat: arm B couldn't be tested **with BM25** — variant `bm25_tf.npz` is truncated **as committed** (LFS hash matches pointer; zip EOCD missing) → Ron must rebuild via `scripts/stage_bm25.py artifacts_variants/notitle_150`. `scripts/sweep_e5.py` kept for that rerun (`--no-bm25` flag added). |
 | 2026-06-07 | **E6 CE rerank A/B (not merged)** | `yehoraz_develop` | 0.3284 (B) | +0.017 vs 0.3113 | no (blocked) | **Cross-encoder rerank** (Option A: CE-only on shortlist) A/B via `scripts/sweep_rerank_ab.py`. Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`. **Passage text: BM25 token proxy** (no `chunk_texts.npy` yet) — architecture test only. A=0.3113, B(pool=20)=0.3284 (+0.017), B(pool=30–50)≈0.327. Split-half unstable: half-A +0.068, half-B −0.034. CE stage alone ~47s CPU (pool=20); estimated full pipeline ~67–72s → over 60s on CPU. **Not merged.** Blocked on Ron §4.3 (`chunk_texts.npy`) + GPU timing + stable rerun. Preserves all upstream optimizations (PRF/E3/E4/RRF) — CE only reorders top-M fused pages. |
 
 ### 8.1  E1 2×2 synthesis & Ron next direction (2026-06-06, updated 2026-06-07)
@@ -535,8 +536,9 @@ Record every experiment result here so both teammates (and agents) have context.
 1. **E1 + E2 complete.** Production `artifacts/`: title_150 dense + BM25.
 2. **Yehoraz E3 + E4 + PRF complete** on `yehoraz_develop` (0.3113) — not yet merged to `main`.
 3. **Ron → E6 (NOW):** build and commit `chunk_texts.npy` per §4.3 — **unblocks reranking**.
-4. **Ron → E5: done 2026-06-11** — page-vector artifact built on VM, verified, in `artifacts/`. Yehoraz integrates (§4.2.1).
-5. Sentence-aware splitting: still deferred.
+4. **Ron → E5: artifact done 2026-06-11; Yehoraz sweep 2026-06-12 — negative, not integrated** (§4.2.1, §8 log).
+5. **Ron fix:** rebuild truncated `artifacts_variants/notitle_150/bm25_tf.npz` (`scripts/stage_bm25.py`) — needed only for the optional E5 arm-B+BM25 rerun.
+6. Sentence-aware splitting: still deferred.
 
 ### 8.2  Yehoraz query-side progress summary (2026-06-07)
 
@@ -650,10 +652,11 @@ Record every experiment result here so both teammates (and agents) have context.
 1. **Your scope:** `chunk.py`, `embed.py`, `index.py`, `lexical.py`, `scripts/build_index.py`, artifact generation.
 2. **Do not** modify `eval.py` or `retrieve.py`.
 3. **After any index change**, rebuild with `python scripts/build_index.py`, test `python scripts/eval_public.py`.
-4. **Priority (updated 2026-06-07):**
+4. **Priority (updated 2026-06-12):**
    - **E1 + E2:** done. Chunk config locked: `title_150`.
    - **E6 (NOW — highest priority):** persist `chunk_texts.npy` at build time + `load_chunk_texts()`. See §4.3 and §8.4 step-by-step. **This unblocks Yehoraz reranking.**
-   - **E5 (optional):** per-page title embedding artifact for title-vector fusion.
+   - **FIX (small, while on the VM):** `artifacts_variants/notitle_150/bm25_tf.npz` is **truncated as committed** (unreadable zip; LFS oid matches pointer). Rebuild with `python scripts/stage_bm25.py artifacts_variants/notitle_150`, verify `load_bm25()` opens it, re-commit. Needed only for the E5 arm-B+BM25 rerun (low priority — E5 swept negative on `title_150`, see §8).
+   - **E5:** artifact done; Yehoraz swept it 2026-06-12 — **negative, not integrated** (§4.2.1).
    - Sentence-aware splitting: still deferred.
 5. **E6 implementation notes:**
    - Save `np.asarray([c.text for c in chunks], dtype=object)` — same strings sent to `embed_texts()`.
