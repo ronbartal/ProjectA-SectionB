@@ -68,7 +68,14 @@ cd ProjectA-SectionB
 git lfs install                    # one-time: enable the LFS smudge filter for this repo
 git lfs pull                       # REQUIRED: downloads the real artifacts/ (~2.4 GB)
 ls -lh artifacts/index.faiss       # sanity: ~764 MB, NOT a ~130-byte stub
+
+# Use an isolated venv: a stale torch in the system/user site-packages can shadow a
+# good one and break the import (see the register_fake note below). A venv avoids that.
+python -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+pip install --upgrade pip
 pip install -r requirements.txt
+python -c "import torch; print('cuda:', torch.cuda.is_available())"   # expect True
 python scripts/eval_public.py      # prints mean NDCG@10 on the public queries
 ```
 
@@ -89,6 +96,10 @@ must stay under the 60 s budget.
 - **Device:** the pipeline requires a **GPU**. The graded run — query embedding plus the
   cross-encoder rerank — targets the 60 s GPU budget; the cross-encoder is far too slow on CPU.
   Make sure the installed PyTorch build supports the machine's GPU.
+- **`module 'torch.library' has no attribute 'register_fake'`:** an old `torch` (< 2.4) in your
+  system/user site-packages is being imported alongside a newer `torchvision`. Always run inside
+  the `.venv` above (it ignores `~/.local`); if it still appears, `pip uninstall -y torchvision`
+  (this text pipeline does not need it).
 
 ---
 
