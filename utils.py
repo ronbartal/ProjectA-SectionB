@@ -65,9 +65,11 @@ PRF_PAGE_REPR = "mean"  # "mean" (E3-consistent) or "best" (single best chunk)
 # fused pages; final order = RERANK_ALPHA*ce_minmax + (1-alpha)*fused_rank_norm.
 # A/B 2026-06-12 (real chunk_texts, 29 q): pool=20 alpha=0.3 k-fold +0.0115 and
 # split-half stable; pure CE order (+0.009) was unstable -> blend only.
-# DEFAULT OFF: CE stage alone measured ~61s on local CPU (29 q) vs the 60s
-# query budget. Flip RERANK=True once GPU timing is verified (Ron, VM).
-RERANK = False
+# GPU timing verified on VM 2026-06-12 (Ron): full query phase with rerank =
+# 8.58s on 29 queries (12.5s on 50) vs the 60s budget -> enabled. k-fold on
+# GPU = 0.4406, sanity PASSED (results/diag_rerank_gpu.json). On CPU the CE
+# stage alone is ~61s — grading runs on GPU per assignment, so this is safe.
+RERANK = True
 RERANK_POOL = 20
 RERANK_ALPHA = 0.3
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"

@@ -82,9 +82,13 @@ def rerank_pages(
         pid: ((s - lo) / (hi - lo) if hi > lo else 0.5)
         for pid, s in zip(pids, scores)
     }
-    in_ce = [p for p in fused_pages if p in ce_norm]
+    # Fused component uses the ORIGINAL fused rank (not the rank within the
+    # CE-scored subset), matching the validated A/B sweep exactly. Pages whose
+    # fused rank exceeds the subset size get a slightly negative value, which
+    # just keeps the fused penalty growing for missing-passage edge cases.
+    fused_rank = {p: r for r, p in enumerate(fused_pages) if p in ce_norm}
     fused_norm = {
-        p: 1.0 - r / max(len(in_ce) - 1, 1) for r, p in enumerate(in_ce)
+        p: 1.0 - fused_rank[p] / max(len(pids) - 1, 1) for p in ce_norm
     }
     blended = sorted(
         pids,
