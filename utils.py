@@ -10,6 +10,9 @@ DATA_DIR = STUDENT_ROOT / "data"
 ENTRIES_DIR = DATA_DIR / "Wikipedia Entries"
 PUBLIC_QUERIES_PATH = DATA_DIR / "public_queries.json"
 ARTIFACTS_DIR = STUDENT_ROOT / "artifacts"
+# Experiment-only artifacts that run() does NOT load (kept out of the deployed
+# artifacts/ so the graded clone only pulls what the pipeline actually uses).
+ARTIFACTS_VARIANTS_DIR = STUDENT_ROOT / "artifacts_variants"
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 K_EVAL = 10

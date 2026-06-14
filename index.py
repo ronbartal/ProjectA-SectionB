@@ -8,8 +8,11 @@ Persists chunk + lexical artifacts (see page_index.py for E5 page-level files):
   - bm25_tf.npz       : CSR term-frequency matrix per chunk (E2).
   - bm25_meta.json    : corpus BM25 statistics (E2).
   - chunk_texts.npy   : passage strings per chunk (E6 cross-encoder rerank).
-  - page_vectors.npy  : float32 (n_pages x 384) — built via scripts/build_page_index.py
-  - page_meta.json    : page_id list + E5 recipe metadata
+
+Experiment-only page-level files (NOT loaded by run(); under artifacts_variants/,
+built via scripts/build_page_index.py):
+  - page_vectors.npy  : float32 (n_pages x 384) per-page embeddings (E5).
+  - page_meta.json    : page_id list + E5 recipe metadata.
 
 retrieve.py searches the FAISS index and aggregates chunk hits back to pages.
 The numpy vectors are kept as a fallback in case FAISS is unavailable.

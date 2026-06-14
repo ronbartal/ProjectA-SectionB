@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from embed import embed_texts
-from utils import ARTIFACTS_DIR, EMBEDDING_MODEL_NAME, iter_entries
+from utils import ARTIFACTS_VARIANTS_DIR, EMBEDDING_MODEL_NAME, iter_entries
 
 PAGE_VECTORS_NAME = "page_vectors.npy"
 PAGE_META_NAME = "page_meta.json"
@@ -68,7 +68,7 @@ def build_page_index(
 
     Returns (vectors, page_ids) with row i aligned to page_ids[i] (sorted by page_id).
     """
-    out_dir = artifacts_dir or ARTIFACTS_DIR
+    out_dir = artifacts_dir or ARTIFACTS_VARIANTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if records is None:
@@ -123,7 +123,7 @@ class PageIndex:
 
 def load_page_index(artifacts_dir: Optional[Path] = None) -> PageIndex:
     """Load page_vectors.npy and page_meta.json from artifacts/."""
-    root = artifacts_dir or ARTIFACTS_DIR
+    root = artifacts_dir or ARTIFACTS_VARIANTS_DIR
     vectors_path = root / PAGE_VECTORS_NAME
     meta_path = root / PAGE_META_NAME
     missing = [p.name for p in (vectors_path, meta_path) if not p.exists()]
