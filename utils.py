@@ -63,16 +63,21 @@ PRF_PAGE_REPR = "mean"  # "mean" (E3-consistent) or "best" (single best chunk)
 
 # E6 cross-encoder rerank (rerank.py). The CE reorders only the top-RERANK_POOL
 # fused pages; final order = RERANK_ALPHA*ce_minmax + (1-alpha)*fused_rank_norm.
-# A/B 2026-06-12 (real chunk_texts, 29 q): pool=20 alpha=0.3 k-fold +0.0115 and
-# split-half stable; pure CE order (+0.009) was unstable -> blend only.
-# GPU timing verified on VM 2026-06-12 (Ron): full query phase with rerank =
-# 8.58s on 29 queries (12.5s on 50) vs the 60s budget -> enabled. k-fold on
-# GPU = 0.4406, sanity PASSED (results/diag_rerank_gpu.json). On CPU the CE
-# stage alone is ~61s — grading runs on GPU per assignment, so this is safe.
+# Original E6 (2026-06-12): L-6 / pool=20 / alpha=0.3 -> k-fold 0.4406 (mean 0.4394).
+# Model/pool/alpha sweep (29 q, GPU, single best chunk): the 12-layer MS-MARCO CE
+# with a deeper pool and more CE weight is the sweet spot — L-12 / pool=50 /
+# alpha=0.5 -> k-fold 0.4540 (mean 0.4530), +0.013 over the L-6 config. The big
+# multilingual rerankers (bge-reranker-base, bge-v2-m3) scored BELOW L-6 and were
+# far slower (bge-v2-m3 ~30s CE alone at pool 50) -> rejected. Pools beyond 50
+# were noise (non-monotonic) with worsening split-half stability -> 50 chosen.
+# NOTE: the +0.013 gain is half-A-concentrated on the noisy 29-q public set;
+# confirm on a larger query set before treating it as locked. Multi-chunk
+# (max-pool over 2-3 chunks/page) was tried and was negative -> not adopted.
+# Full-pipeline timing on RTX 5080: 17.4s/29 q (well under the 60s budget).
 RERANK = True
-RERANK_POOL = 20
-RERANK_ALPHA = 0.3
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_POOL = 50
+RERANK_ALPHA = 0.5
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"
 # Graded query phase budget: one run(queries) call (embed + retrieve), GPU at grading.
 GRADING_QUERY_TIME_LIMIT_S = 60.0
 
