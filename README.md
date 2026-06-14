@@ -14,7 +14,7 @@ Each query is processed in these steps:
 3. **Expand (PRF):** query expansion based on the top results, then re-search.
 4. **Score:** rank the candidates with BM25.
 5. **Fuse (RRF):** merge the dense and BM25 rankings.
-6. **Rerank (optional):** cross-encoder over the shortlist.
+6. **Rerank:** a cross-encoder (MiniLM-L-12) rescores the fused shortlist.
 
 **Presentation video:** _TODO — add the public link here before submission (required)._
 
@@ -30,28 +30,44 @@ Each query is processed in these steps:
 | `index.py` | Offline chunk index build (embed → FAISS + meta) and load helpers. |
 | `lexical.py` | BM25: tokenizer, offline CSR/IDF build, and Okapi scorer. |
 | `retrieve.py` | Query-time pipeline (`search_batch`): embed → FAISS → aggregate → RRF → PRF → top-10. |
-| `rerank.py` | Optional cross-encoder reranker over the fused shortlist. |
-| `page_index.py` | Per-page embedding variant (experiment; not in the active path). |
+| `rerank.py` | Cross-encoder reranker over the fused shortlist (enabled by default). |
+| `page_index.py` | Per-page embedding variant (experiment; writes to `artifacts_variants/`, not used by `run()`). |
 | `utils.py` | Paths, tunable constants, corpus/query loaders. |
 | `eval.py` | **Read-only** NDCG@10 utilities. |
 | `scripts/build_index.py` | **Read-only** offline build driver. |
 | `scripts/eval_public.py` | **Read-only** self-test → mean NDCG@10 on public queries. |
 | `data/public_queries.json` | Labeled public queries. |
-| `artifacts/` | Prebuilt index (see Artifacts below). |
+| `artifacts/` | Prebuilt index loaded by `run()` (see Artifacts below). |
+| `artifacts_variants/` | Experiment-only artifacts **not** loaded by `run()`. |
 
 ---
 
 ## Quick start
 
-The corpus index is **prebuilt and shipped under `artifacts/`**.
-No need to rebuild it, only import `run()` and load the artifacts from disk. The large artifacts are
-stored with **Git LFS**, so you must fetch them after cloning.
+The corpus index is **prebuilt and shipped under `artifacts/`** via **Git LFS** (~2.4 GB).
+You must have Git LFS installed and fetch the artifacts after cloning — without them `run()`
+only sees ~130-byte pointer stubs and returns nothing. No index rebuild is needed.
+
+**Step 1 — install Git LFS** (skip if `git lfs version` already prints a version).
+With sudo: `sudo apt-get install git-lfs`  (or `conda install -c conda-forge git-lfs`).
+Without sudo, install the static binary into your home directory:
 
 ```bash
-# Requires: Python 3.10+, git-lfs installed (https://git-lfs.com)
+LFS_VER=$(curl -s https://api.github.com/repos/git-lfs/git-lfs/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+curl -L "https://github.com/git-lfs/git-lfs/releases/download/v${LFS_VER}/git-lfs-linux-amd64-v${LFS_VER}.tar.gz" | tar -xz
+mkdir -p ~/.local/bin && cp git-lfs-*/git-lfs ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"      # add this line to ~/.bashrc to persist
+git lfs version
+```
+
+**Step 2 — clone, fetch artifacts, install deps, run** (Python 3.10+):
+
+```bash
 git clone https://github.com/ronbartal/ProjectA-SectionB
 cd ProjectA-SectionB
-git lfs pull                       # REQUIRED: fetches artifacts/index.faiss + index_vectors.npy
+git lfs install                    # one-time: enable the LFS smudge filter for this repo
+git lfs pull                       # REQUIRED: downloads the real artifacts/ (~2.4 GB)
+ls -lh artifacts/index.faiss       # sanity: ~764 MB, NOT a ~130-byte stub
 pip install -r requirements.txt
 python scripts/eval_public.py      # prints mean NDCG@10 on the public queries
 ```
@@ -59,17 +75,20 @@ python scripts/eval_public.py      # prints mean NDCG@10 on the public queries
 `eval_public.py` prints, e.g.:
 ```
 public_queries=29
-mean_ndcg@10=0.4274
-query_phase_time=7.16s
+mean_ndcg@10=0.4530
+query_phase_time=<GPU-dependent>
 ```
+`query_phase_time` covers loading the artifacts + both models and running all queries; it varies
+widely by machine (single-digit seconds on a datacenter GPU, tens of seconds on a laptop GPU) and
+must stay under the 60 s budget.
 
 ### Notes
 
 - **Git LFS:** if `run()` raises `FileNotFoundError` for `artifacts/index.faiss` or
   `artifacts/index_vectors.npy`, Git LFS did not fetch them — run `git lfs install && git lfs pull`.
-- **Device:** the embedding model runs on GPU if available, else CPU (auto-detected). The graded
-  run assumes a GPU for the <= 60 s budget. On a machine whose PyTorch build doesn't support its
-  GPU it falls back to CPU automatically.
+- **Device:** the pipeline requires a **GPU**. The graded run — query embedding plus the
+  cross-encoder rerank — targets the 60 s GPU budget; the cross-encoder is far too slow on CPU.
+  Make sure the installed PyTorch build supports the machine's GPU.
 
 ---
 
@@ -83,7 +102,9 @@ The system has two phases — an **offline build** and the **online query** call
 corpus pages
   → chunk into overlapping ~150-word passages   (chunk.py)
   → embed each passage with MiniLM, 384-d        (embed.py)
-  → build a FAISS cosine index + a BM25 index    (index.py / lexical.py)
+  → build a FAISS cosine index over the vectors  (index.py)
+  → build a BM25 lexical index                   (lexical.py)
+  → save the chunk passage texts (for rerank)    (chunk_texts.npy)
   → save to artifacts/
 ```
 
@@ -96,7 +117,7 @@ query
   → PRF: expand the query from the top hits, then search again
   → score each candidate page:  dense cosine  +  BM25
   → fuse the two rankings with RRF
-  → (optional) cross-encoder rerank the shortlist
+  → cross-encoder rerank the top-50 fused shortlist (MiniLM-L-12)
   → return the 10 best page_ids
 ```
 
@@ -113,11 +134,12 @@ query
    (`BM25_PAGE_AGG="max"`, `BM25_SCOPE="window"`; Okapi `k1=1.5, b=0.75`).
 6. **Fusion:** Reciprocal Rank Fusion of the dense and BM25 page rankings
    (`FUSION="rrf"`, `RRF_K=60`).
-7. Return the top `K_EVAL=10` page_ids per query.
-8. **Optional rerank** (`RERANK=False` by default): a cross-encoder
-   (`cross-encoder/ms-marco-MiniLM-L-6-v2`) rescores the top `RERANK_POOL=20` fused pages and
-   blends the CE score with the fused rank. Off by default because it can exceed the 60 s CPU
-   budget; enable it (`RERANK=True` in `utils.py`) on a GPU machine.
+7. **Rerank** (`RERANK=True`): a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-12-v2`) rescores
+   the top `RERANK_POOL=50` fused pages, scoring each page's best in-window chunk as the passage.
+   The final order blends the CE score with the fused rank,
+   `RERANK_ALPHA=0.5 * ce_minmax + 0.5 * fused_rank_norm`. Requires a GPU (the cross-encoder is too
+   slow on CPU for the 60 s budget).
+8. Return the top `K_EVAL=10` page_ids per query.
 
 ---
 
@@ -131,12 +153,10 @@ Corpus = 27,074 pages → 521,322 chunks, embedding dim 384.
 | `index_vectors.npy` | `np.save`, float32 `(521322, 384)` | L2-normalized chunk embeddings (row-aligned with the FAISS index). | yes |
 | `index.faiss` | FAISS `IndexFlatIP` | Exact cosine index over the chunk vectors. | yes |
 | `index_meta.json` | JSON | `page_ids` (len 521322, chunk-row → page_id), `chunk_ids`, `model`, `num_vectors`, `dim=384`, `chunk_words=150`, `chunk_overlap=33`, `prefix_title=true`. | yes |
-| `chunk_texts.npy` | `np.save` object `(521322,)` | The passage text per chunk (row-aligned). Used only by the optional reranker. | yes |
+| `chunk_texts.npy` | `np.save` object `(521322,)` | The passage text per chunk (row-aligned). Used by the cross-encoder reranker. | yes |
 | `bm25_tf.npz` | `np.savez` | CSR term-frequency matrix: `data` (f32), `indices` (i32), `indptr` (i32, len 521323), `vocab` (object). | yes |
 | `bm25_vocab.json` | JSON `dict[str, float]` | token → IDF (vocab size 319,990). | yes |
 | `bm25_meta.json` | JSON | `n_docs`, `vocab_size`, `avg_dl`, `k1=1.5`, `b=0.75`, `min_df=2`, `tokenizer`, chunk params. | no  |
-| `page_vectors.npy` | `np.save`, float32 `(27074, 384)` | Per-page vectors (title + first/last sentence). **Built for an experiment; not used by the current `run()`.** | yes |
-| `page_meta.json` | JSON | `model`, `num_pages=27074`, `dim=384`, `recipe`, `page_ids`. | no  |
 
 
 ---
@@ -152,7 +172,8 @@ Corpus = 27,074 pages → 521,322 chunks, embedding dim 384.
 | `AGG_SCOPE`, `PAGE_POOL_K` | `page`, 0 | Page score = mean cosine over all page chunks. |
 | `FUSION`, `RRF_K` | `rrf`, 60 | Reciprocal Rank Fusion of dense + BM25. |
 | `PRF`, `PRF_ALPHA`, `PRF_TOPN` | `True`, 0.9, 10 | Pseudo-relevance feedback expansion. |
-| `RERANK`, `RERANK_POOL` | `False`, 20 | Optional cross-encoder rerank (enable on GPU). |
+| `RERANK`, `RERANK_POOL`, `RERANK_ALPHA` | `True`, 50, 0.5 | Cross-encoder rerank of the fused shortlist (GPU). |
+| `RERANK_MODEL_NAME` | `cross-encoder/ms-marco-MiniLM-L-12-v2` | Reranker cross-encoder model. |
 | `K_EVAL` | 10 | Ranked IDs scored per query. |
 
 ---
@@ -166,5 +187,6 @@ Each design step was validated on the public queries before adoption:
 | Dense chunk baseline | 0.133 |
 | + page-scope aggregation | 0.248 |
 | + RRF fusion (dense + BM25) | 0.299 |
-| + PRF query expansion (**default**) | **0.311** |
-| + cross-encoder rerank (GPU) | 0.439 |
+| + PRF query expansion | 0.311 |
+| + cross-encoder rerank, MiniLM-L-6 / pool 20 / alpha 0.3 (GPU) | 0.439 |
+| + reranker upgrade: MiniLM-L-12 / pool 50 / alpha 0.5 (**default**) | **0.453** |
