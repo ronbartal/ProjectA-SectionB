@@ -93,9 +93,12 @@ must stay under the 60 s budget.
 
 - **Git LFS:** if `run()` raises `FileNotFoundError` for `artifacts/index.faiss` or
   `artifacts/index_vectors.npy`, Git LFS did not fetch them — run `git lfs install && git lfs pull`.
-- **Device:** the pipeline requires a **GPU**. The graded run — query embedding plus the
-  cross-encoder rerank — targets the 60 s GPU budget; the cross-encoder is far too slow on CPU.
-  Make sure the installed PyTorch build supports the machine's GPU.
+- **Device / pinned torch:** the pipeline requires a **GPU**. The graded run — query embedding
+  plus the cross-encoder rerank — targets the 60 s GPU budget; the cross-encoder is far too slow
+  on CPU. `requirements.txt` pins `torch==2.3.1+cu121` (via the PyTorch cu121 index) and
+  `sentence-transformers==3.3.1` because an unpinned install resolves to a CUDA-13 torch that does
+  **not** support the course VM's Tesla M60 and silently falls back to CPU. After install, verify
+  with `python -c "import torch; print(torch.cuda.is_available())"` → expect `True`.
 - **`module 'torch.library' has no attribute 'register_fake'`:** an old `torch` (< 2.4) in your
   system/user site-packages is being imported alongside a newer `torchvision`. Always run inside
   the `.venv` above (it ignores `~/.local`); if it still appears, `pip uninstall -y torchvision`

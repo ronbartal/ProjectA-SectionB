@@ -1,3 +1,23 @@
-numpy>=1.24
-sentence-transformers>=2.2.0
-faiss-cpu>=1.7.4
+# Pinned to the GPU-working environment validated on the course VM
+# (Tesla M60, NVIDIA driver 535.x / CUDA 12.2). The cross-encoder reranker must
+# run on GPU to stay under the 60 s budget. An UNPINNED install resolves to
+# sentence-transformers 5.x, which drags in a torch built for CUDA 13 — that
+# wheel does NOT support the M60, so torch.cuda.is_available() returns False and
+# the pipeline silently falls back to CPU (and blows the time limit). The pins
+# below reproduce torch 2.3.1+cu121 with torch.cuda.is_available() == True.
+#
+# The PyTorch cu121 wheels live on PyTorch's own index, not PyPI:
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.3.1+cu121
+
+numpy==2.2.6
+sentence-transformers==3.3.1
+faiss-cpu==1.14.2
+
+# Transitive deps of sentence-transformers, pinned to the validated set so the
+# resolver cannot pull a newer transformers/tokenizers that would in turn force
+# an incompatible torch build.
+transformers==4.46.3
+huggingface-hub==0.36.2
+tokenizers==0.20.3
