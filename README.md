@@ -67,34 +67,6 @@ public_queries=29
 mean_ndcg@10=0.4530
 query_phase_time=<GPU-dependent>
 ```
-`query_phase_time` covers loading the artifacts + both models and running all queries; it varies
-widely by machine (single-digit seconds on a datacenter GPU, tens of seconds on a laptop GPU) and
-must stay under the 60 s budget. On the course VM (Tesla M60) a full cold run — including the
-first-time download of both models — measured **~21 s**, comfortably inside the budget.
-
-### Notes
-
-- **Git LFS:** if `run()` raises `FileNotFoundError` for `artifacts/index.faiss` or
-  `artifacts/index_vectors.npy`, Git LFS did not fetch them — run `git lfs install && git lfs pull`.
-- **Device / pinned torch:** the pipeline requires a **GPU**. The graded run — query embedding
-  plus the cross-encoder rerank — targets the 60 s GPU budget; the cross-encoder is far too slow
-  on CPU. `requirements.txt` pins `torch==2.3.1+cu121` (via the PyTorch cu121 index) and
-  `sentence-transformers==3.3.1` because an unpinned install resolves to a CUDA-13 torch that does
-  **not** support the course VM's Tesla M60 and silently falls back to CPU. After install, verify
-  with `python -c "import torch; print(torch.cuda.is_available())"` → expect `True`.
-- **`module 'torch.library' has no attribute 'register_fake'`:** an old `torch` (< 2.4) in your
-  system/user site-packages is being imported alongside a newer `torchvision`. Always run inside
-  the `.venv` above (it ignores `~/.local`); if it still appears, `pip uninstall -y torchvision`
-  (this text pipeline does not need it).
-- **`ensurepip is not available` when creating the venv:** a bare course VM may lack the
-  `python3.10-venv` package. Either `sudo apt-get install python3.10-venv`, or create the env
-  without pip and bootstrap it manually:
-  ```bash
-  python3 -m venv --without-pip .venv
-  source .venv/bin/activate
-  curl -sS https://bootstrap.pypa.io/get-pip.py | python
-  pip install -r requirements.txt
-  ```
 
 ---
 
