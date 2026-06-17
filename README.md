@@ -38,7 +38,6 @@ Each query is processed in these steps:
 | `scripts/eval_public.py` | **Read-only** self-test → mean NDCG@10 on public queries. |
 | `data/public_queries.json` | Labeled public queries. |
 | `artifacts/` | Prebuilt index loaded by `run()` (see Artifacts below). |
-| `artifacts_variants/` | Experiment-only artifacts **not** loaded by `run()`. |
 
 ---
 
@@ -87,7 +86,8 @@ query_phase_time=<GPU-dependent>
 ```
 `query_phase_time` covers loading the artifacts + both models and running all queries; it varies
 widely by machine (single-digit seconds on a datacenter GPU, tens of seconds on a laptop GPU) and
-must stay under the 60 s budget.
+must stay under the 60 s budget. On the course VM (Tesla M60) a full cold run — including the
+first-time download of both models — measured **~21 s**, comfortably inside the budget.
 
 ### Notes
 
@@ -103,6 +103,15 @@ must stay under the 60 s budget.
   system/user site-packages is being imported alongside a newer `torchvision`. Always run inside
   the `.venv` above (it ignores `~/.local`); if it still appears, `pip uninstall -y torchvision`
   (this text pipeline does not need it).
+- **`ensurepip is not available` when creating the venv:** a bare course VM may lack the
+  `python3.10-venv` package. Either `sudo apt-get install python3.10-venv`, or create the env
+  without pip and bootstrap it manually:
+  ```bash
+  python3 -m venv --without-pip .venv
+  source .venv/bin/activate
+  curl -sS https://bootstrap.pypa.io/get-pip.py | python
+  pip install -r requirements.txt
+  ```
 
 ---
 
@@ -179,7 +188,7 @@ Corpus = 27,074 pages → 521,322 chunks, embedding dim 384.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (384-d). |
+| `EMBEDDING_MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (384-d). |
 | `CHUNK_WORDS`, `CHUNK_OVERLAP` | 150, 33 | Chunk window / overlap. |
 | `PREFIX_TITLE` | `True` | Prepend page title to each chunk. |
 | `TOP_CHUNKS` | 500 | FAISS candidates per query. |
