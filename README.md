@@ -41,8 +41,6 @@ Each query is processed in these steps:
 ## Quick start
 
 The corpus index is **prebuilt and shipped under `artifacts/`** via **Git LFS** (~2.4 GB).
-You must have Git LFS installed ([git-lfs.com](https://git-lfs.com)) and fetch the artifacts
-after cloning — without them `run()` only sees ~130-byte pointer stubs and returns nothing.
 No index rebuild is needed.
 
 Clone, fetch artifacts, install deps, run (Python 3.10+):
