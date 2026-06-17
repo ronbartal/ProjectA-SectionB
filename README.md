@@ -1,11 +1,8 @@
 # Section B — Wikipedia-Style Retrieval Pipeline
 
-End-to-end semantic page-level text retrieval over a ~27K-page Wikipedia-style corpus. 
+End-to-end semantic page-level text retrieval over a ~27K-page Wikipedia-style corpus.
 
-Given a batch of natural-language queries, the graded entry point
-`run(queries: list[str]) -> list[list[int]]` returns one ranked list of `page_id`s per query (best
-first), scored by **NDCG@10** (binary relevance; only the top 10 per query count). `main.run`
-delegates to `retrieve.search_batch`.
+Given a batch of natural-language queries, the graded entry point `run(queries: list[str]) -> list[list[int]]` returns one ranked list of `page_id`s per query (best first), scored by **NDCG@10** (binary relevance; only the top 10 per query count). `main.run` delegates to `retrieve.search_batch`.
 
 Each query is processed in these steps:
 
@@ -44,22 +41,11 @@ Each query is processed in these steps:
 ## Quick start
 
 The corpus index is **prebuilt and shipped under `artifacts/`** via **Git LFS** (~2.4 GB).
-You must have Git LFS installed and fetch the artifacts after cloning — without them `run()`
-only sees ~130-byte pointer stubs and returns nothing. No index rebuild is needed.
+You must have Git LFS installed ([git-lfs.com](https://git-lfs.com)) and fetch the artifacts
+after cloning — without them `run()` only sees ~130-byte pointer stubs and returns nothing.
+No index rebuild is needed.
 
-**Step 1 — install Git LFS** (skip if `git lfs version` already prints a version).
-With sudo: `sudo apt-get install git-lfs`  (or `conda install -c conda-forge git-lfs`).
-Without sudo, install the static binary into your home directory:
-
-```bash
-LFS_VER=$(curl -s https://api.github.com/repos/git-lfs/git-lfs/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
-curl -L "https://github.com/git-lfs/git-lfs/releases/download/v${LFS_VER}/git-lfs-linux-amd64-v${LFS_VER}.tar.gz" | tar -xz
-mkdir -p ~/.local/bin && cp git-lfs-*/git-lfs ~/.local/bin/
-export PATH="$HOME/.local/bin:$PATH"      # add this line to ~/.bashrc to persist
-git lfs version
-```
-
-**Step 2 — clone, fetch artifacts, install deps, run** (Python 3.10+):
+Clone, fetch artifacts, install deps, run (Python 3.10+):
 
 ```bash
 git clone https://github.com/ronbartal/ProjectA-SectionB
@@ -72,7 +58,6 @@ ls -lh artifacts/index.faiss       # sanity: ~764 MB, NOT a ~130-byte stub
 # good one and break the import (see the register_fake note below). A venv avoids that.
 python -m venv .venv
 source .venv/bin/activate           # Windows: .venv\Scripts\activate
-pip install --upgrade pip
 pip install -r requirements.txt
 python -c "import torch; print('cuda:', torch.cuda.is_available())"   # expect True
 python scripts/eval_public.py      # prints mean NDCG@10 on the public queries
@@ -180,7 +165,6 @@ Corpus = 27,074 pages → 521,322 chunks, embedding dim 384.
 | `bm25_tf.npz` | `np.savez` | CSR term-frequency matrix: `data` (f32), `indices` (i32), `indptr` (i32, len 521323), `vocab` (object). | yes |
 | `bm25_vocab.json` | JSON `dict[str, float]` | token → IDF (vocab size 319,990). | yes |
 | `bm25_meta.json` | JSON | `n_docs`, `vocab_size`, `avg_dl`, `k1=1.5`, `b=0.75`, `min_df=2`, `tokenizer`, chunk params. | no  |
-
 
 ---
 
