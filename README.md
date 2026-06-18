@@ -13,7 +13,7 @@ Each query is processed in these steps:
 5. **Fuse (RRF):** merge the dense and BM25 rankings.
 6. **Rerank:** a cross-encoder (MiniLM-L-12) rescores the fused shortlist.
 
-**Presentation video:** https://github.com/ronbartal/ProjectA-SectionB/blob/main/Video%20Project%20A%20Section%20B.mp4
+**Presentation video to download:** https://github.com/ronbartal/ProjectA-SectionB/blob/main/Video%20Project%20A%20Section%20B.mp4
 
 ---
 
